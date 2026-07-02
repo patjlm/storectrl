@@ -18,6 +18,25 @@ import (
 	"reconkit"
 )
 
+const defaultEventLogSize = 1000
+
+type eventLogEntry struct {
+	revision int64
+	gvk      schema.GroupVersionKind
+	event    reconkit.Event
+}
+
+// StoreOption configures a MemoryStore.
+type StoreOption func(*MemoryStore)
+
+// WithEventLogSize sets the maximum number of events retained for watch
+// resumption. Older events are discarded. Default is 1000.
+func WithEventLogSize(size int) StoreOption {
+	return func(s *MemoryStore) {
+		s.eventLogMax = size
+	}
+}
+
 // MemoryStore is an in-memory implementation of reconkit.Store.
 // It stores objects in memory organized by GVK and ObjectKey,
 // and supports watching for changes.
@@ -30,15 +49,27 @@ type MemoryStore struct {
 	watchers map[schema.GroupVersionKind][]*memoryWatcher
 	// uidCounter for generating unique UIDs
 	uidCounter atomic.Int64
+	// revision is a global monotonic counter incremented on every mutation.
+	// Mirrors etcd's MVCC revision — every Create/Update/Delete gets a unique,
+	// ordered revision number used as the object's ResourceVersion.
+	revision atomic.Int64
+	// eventLog is a bounded buffer of recent events for watch resumption.
+	eventLog    []eventLogEntry
+	eventLogMax int
 }
 
 // NewStore creates a new in-memory store with the given scheme.
-func NewStore(scheme *runtime.Scheme) *MemoryStore {
-	return &MemoryStore{
-		scheme:   scheme,
-		objects:  make(map[schema.GroupVersionKind]map[client.ObjectKey]client.Object),
-		watchers: make(map[schema.GroupVersionKind][]*memoryWatcher),
+func NewStore(scheme *runtime.Scheme, opts ...StoreOption) *MemoryStore {
+	s := &MemoryStore{
+		scheme:      scheme,
+		objects:     make(map[schema.GroupVersionKind]map[client.ObjectKey]client.Object),
+		watchers:    make(map[schema.GroupVersionKind][]*memoryWatcher),
+		eventLogMax: defaultEventLogSize,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Get retrieves an object by key.
@@ -110,6 +141,12 @@ func (s *MemoryStore) List(ctx context.Context, list client.ObjectList, opts ...
 		filtered = append(filtered, objCopy)
 	}
 
+	// Set list resource version to current global revision so callers
+	// can start a watch from this point without missing events.
+	if setter, ok := list.(interface{ SetResourceVersion(string) }); ok {
+		setter.SetResourceVersion(strconv.FormatInt(s.revision.Load(), 10))
+	}
+
 	// Populate the Items field using reflection
 	return s.populateListItems(list, filtered)
 }
@@ -147,19 +184,19 @@ func (s *MemoryStore) Create(ctx context.Context, obj client.Object) error {
 		accessor.SetUID(types.UID(uid))
 	}
 
-	if accessor.GetResourceVersion() == "" {
-		accessor.SetResourceVersion("1")
-	}
+	rv := s.revision.Add(1)
+	accessor.SetResourceVersion(strconv.FormatInt(rv, 10))
 
 	// Deep copy and store
 	stored := obj.DeepCopyObject().(client.Object)
 	gvkMap[key] = stored
 
-	// Notify watchers
-	s.notifyWatchers(gvk, reconkit.Event{
+	event := reconkit.Event{
 		Type:   reconkit.EventAdded,
 		Object: stored.DeepCopyObject().(client.Object),
-	})
+	}
+	s.logEvent(gvk, rv, event)
+	s.notifyWatchers(gvk, event)
 
 	// Copy back to obj to include generated fields
 	return s.copyObject(stored, obj)
@@ -202,20 +239,19 @@ func (s *MemoryStore) Update(ctx context.Context, obj client.Object) error {
 		return &reconkit.ConflictError{Key: key.String()}
 	}
 
-	// Increment resource version
-	rv, _ := strconv.ParseInt(storedAccessor.GetResourceVersion(), 10, 64)
-	newRV := strconv.FormatInt(rv+1, 10)
-	objAccessor.SetResourceVersion(newRV)
+	rv := s.revision.Add(1)
+	objAccessor.SetResourceVersion(strconv.FormatInt(rv, 10))
 
 	// Deep copy and store
 	updated := obj.DeepCopyObject().(client.Object)
 	gvkMap[key] = updated
 
-	// Notify watchers
-	s.notifyWatchers(gvk, reconkit.Event{
+	event := reconkit.Event{
 		Type:   reconkit.EventModified,
 		Object: updated.DeepCopyObject().(client.Object),
-	})
+	}
+	s.logEvent(gvk, rv, event)
+	s.notifyWatchers(gvk, event)
 
 	// Copy back to obj to include updated fields
 	return s.copyObject(updated, obj)
@@ -245,28 +281,68 @@ func (s *MemoryStore) Delete(ctx context.Context, obj client.Object) error {
 
 	delete(gvkMap, key)
 
-	// Notify watchers
-	s.notifyWatchers(gvk, reconkit.Event{
+	deletedCopy := stored.DeepCopyObject().(client.Object)
+	deletedAccessor, err := meta.Accessor(deletedCopy)
+	if err != nil {
+		return err
+	}
+
+	rv := s.revision.Add(1)
+	deletedAccessor.SetResourceVersion(strconv.FormatInt(rv, 10))
+
+	event := reconkit.Event{
 		Type:   reconkit.EventDeleted,
-		Object: stored.DeepCopyObject().(client.Object),
-	})
+		Object: deletedCopy,
+	}
+	s.logEvent(gvk, rv, event)
+	s.notifyWatchers(gvk, event)
 
 	return nil
 }
 
 // Watch creates a watcher for objects of the list type.
+// If WatchFromRevision is passed in opts, events after that revision are
+// replayed from the event log before live events begin. Returns
+// RevisionTooOldError if the requested revision has been compacted.
 func (s *MemoryStore) Watch(ctx context.Context, list client.ObjectList, opts ...client.ListOption) (reconkit.Watcher, error) {
 	gvk, err := s.gvkForList(list)
 	if err != nil {
 		return nil, err
 	}
 
+	var fromRevision int64
+	resuming := false
+	for _, opt := range opts {
+		if rv, ok := opt.(reconkit.WatchFromRevision); ok {
+			fromRevision = int64(rv)
+			resuming = true
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	w := newMemoryWatcher(s, gvk)
-	s.watchers[gvk] = append(s.watchers[gvk], w)
+	var replay []reconkit.Event
+	if resuming {
+		replay, err = s.eventsSince(fromRevision, gvk)
+		if err != nil {
+			return nil, err
+		}
+	}
 
+	bufSize := 100
+	if len(replay) > bufSize {
+		bufSize = len(replay) + 100
+	}
+	w := newMemoryWatcher(s, gvk, bufSize)
+
+	// Pre-load replay events while holding the lock — any mutation after
+	// unlock will be caught by the live registration below. No gap.
+	for _, evt := range replay {
+		w.ch <- evt
+	}
+
+	s.watchers[gvk] = append(s.watchers[gvk], w)
 	return w, nil
 }
 
@@ -390,6 +466,53 @@ func (l labelSet) Lookup(label string) (string, bool) {
 
 func toLabelSet(labels map[string]string) labelSet {
 	return labelSet(labels)
+}
+
+func (s *MemoryStore) logEvent(gvk schema.GroupVersionKind, revision int64, event reconkit.Event) {
+	s.eventLog = append(s.eventLog, eventLogEntry{
+		revision: revision,
+		gvk:      gvk,
+		event:    event,
+	})
+	if len(s.eventLog) > s.eventLogMax {
+		excess := len(s.eventLog) - s.eventLogMax
+		trimmed := make([]eventLogEntry, s.eventLogMax)
+		copy(trimmed, s.eventLog[excess:])
+		s.eventLog = trimmed
+	}
+}
+
+// eventsSince returns events for the given GVK after fromRevision.
+// Must be called under s.mu.
+func (s *MemoryStore) eventsSince(fromRevision int64, gvk schema.GroupVersionKind) ([]reconkit.Event, error) {
+	currentRevision := s.revision.Load()
+
+	if fromRevision >= currentRevision {
+		return nil, nil
+	}
+
+	if len(s.eventLog) == 0 {
+		return nil, &reconkit.RevisionTooOldError{
+			RequestedRevision: fromRevision,
+			OldestRevision:    currentRevision + 1,
+		}
+	}
+
+	oldest := s.eventLog[0].revision
+	if fromRevision+1 < oldest {
+		return nil, &reconkit.RevisionTooOldError{
+			RequestedRevision: fromRevision,
+			OldestRevision:    oldest,
+		}
+	}
+
+	var events []reconkit.Event
+	for _, entry := range s.eventLog {
+		if entry.revision > fromRevision && entry.gvk == gvk {
+			events = append(events, entry.event)
+		}
+	}
+	return events, nil
 }
 
 func (s *MemoryStore) Apply(_ context.Context, _ runtime.ApplyConfiguration, _ ...client.ApplyOption) error {

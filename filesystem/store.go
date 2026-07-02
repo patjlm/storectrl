@@ -21,27 +21,57 @@ import (
 	"reconkit"
 )
 
+const defaultEventLogSize = 1000
+
+type eventLogEntry struct {
+	revision int64
+	gvk      schema.GroupVersionKind
+	event    reconkit.Event
+}
+
+// StoreOption configures a FileStore.
+type StoreOption func(*FileStore)
+
+// WithEventLogSize sets the maximum number of events retained for watch
+// resumption. Default is 1000.
+func WithEventLogSize(size int) StoreOption {
+	return func(s *FileStore) {
+		s.eventLogMax = size
+	}
+}
+
 // FileStore is a filesystem-backed implementation of reconkit.Store.
 // Objects are stored as JSON files organized by GVK, namespace, and name:
 //
 //	<root>/<group>/<version>/<kind>/<namespace>/<name>.json
 //
 // Empty group uses "core". Empty namespace uses "_cluster".
+// The global revision counter is persisted at <root>/.revision.
 type FileStore struct {
-	scheme     *runtime.Scheme
-	root       string
-	mu         sync.RWMutex
-	watchers   map[schema.GroupVersionKind][]*fileWatcher
-	uidCounter atomic.Int64
+	scheme      *runtime.Scheme
+	root        string
+	mu          sync.RWMutex
+	watchers    map[schema.GroupVersionKind][]*fileWatcher
+	uidCounter  atomic.Int64
+	revision    atomic.Int64
+	eventLog    []eventLogEntry
+	eventLogMax int
 }
 
 // NewStore creates a new filesystem-backed store rooted at the given directory.
-func NewStore(root string, scheme *runtime.Scheme) *FileStore {
-	return &FileStore{
-		scheme:   scheme,
-		root:     root,
-		watchers: make(map[schema.GroupVersionKind][]*fileWatcher),
+// The global revision counter is loaded from <root>/.revision if it exists.
+func NewStore(root string, scheme *runtime.Scheme, opts ...StoreOption) *FileStore {
+	s := &FileStore{
+		scheme:      scheme,
+		root:        root,
+		watchers:    make(map[schema.GroupVersionKind][]*fileWatcher),
+		eventLogMax: defaultEventLogSize,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	s.loadRevision()
+	return s
 }
 
 func (s *FileStore) Get(ctx context.Context, key client.ObjectKey, obj client.Object) error {
@@ -146,6 +176,10 @@ func (s *FileStore) List(ctx context.Context, list client.ObjectList, opts ...cl
 		}
 	}
 
+	if setter, ok := list.(interface{ SetResourceVersion(string) }); ok {
+		setter.SetResourceVersion(strconv.FormatInt(s.revision.Load(), 10))
+	}
+
 	return s.populateListItems(list, items)
 }
 
@@ -174,9 +208,9 @@ func (s *FileStore) Create(ctx context.Context, obj client.Object) error {
 	if accessor.GetUID() == "" {
 		accessor.SetUID(types.UID(s.generateUID()))
 	}
-	if accessor.GetResourceVersion() == "" {
-		accessor.SetResourceVersion("1")
-	}
+
+	rv := s.revision.Add(1)
+	accessor.SetResourceVersion(strconv.FormatInt(rv, 10))
 
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
@@ -191,10 +225,14 @@ func (s *FileStore) Create(ctx context.Context, obj client.Object) error {
 		return err
 	}
 
-	s.notifyWatchers(gvk, reconkit.Event{
+	s.persistRevision(rv)
+
+	event := reconkit.Event{
 		Type:   reconkit.EventAdded,
 		Object: obj.DeepCopyObject().(client.Object),
-	})
+	}
+	s.logEvent(gvk, rv, event)
+	s.notifyWatchers(gvk, event)
 
 	return nil
 }
@@ -241,8 +279,8 @@ func (s *FileStore) Update(ctx context.Context, obj client.Object) error {
 		return &reconkit.ConflictError{Key: key.String()}
 	}
 
-	rv, _ := strconv.ParseInt(storedAccessor.GetResourceVersion(), 10, 64)
-	objAccessor.SetResourceVersion(strconv.FormatInt(rv+1, 10))
+	rv := s.revision.Add(1)
+	objAccessor.SetResourceVersion(strconv.FormatInt(rv, 10))
 
 	data, err := json.MarshalIndent(obj, "", "  ")
 	if err != nil {
@@ -253,10 +291,14 @@ func (s *FileStore) Update(ctx context.Context, obj client.Object) error {
 		return err
 	}
 
-	s.notifyWatchers(gvk, reconkit.Event{
+	s.persistRevision(rv)
+
+	event := reconkit.Event{
 		Type:   reconkit.EventModified,
 		Object: obj.DeepCopyObject().(client.Object),
-	})
+	}
+	s.logEvent(gvk, rv, event)
+	s.notifyWatchers(gvk, event)
 
 	return nil
 }
@@ -294,10 +336,22 @@ func (s *FileStore) Delete(ctx context.Context, obj client.Object) error {
 		return err
 	}
 
-	s.notifyWatchers(gvk, reconkit.Event{
+	deletedObj := storedObj.(client.Object)
+	deletedAccessor, err := meta.Accessor(deletedObj)
+	if err != nil {
+		return err
+	}
+
+	rv := s.revision.Add(1)
+	s.persistRevision(rv)
+	deletedAccessor.SetResourceVersion(strconv.FormatInt(rv, 10))
+
+	event := reconkit.Event{
 		Type:   reconkit.EventDeleted,
-		Object: storedObj.(client.Object),
-	})
+		Object: deletedObj,
+	}
+	s.logEvent(gvk, rv, event)
+	s.notifyWatchers(gvk, event)
 
 	return nil
 }
@@ -308,17 +362,108 @@ func (s *FileStore) Watch(ctx context.Context, list client.ObjectList, opts ...c
 		return nil, err
 	}
 
+	var fromRevision int64
+	resuming := false
+	for _, opt := range opts {
+		if rv, ok := opt.(reconkit.WatchFromRevision); ok {
+			fromRevision = int64(rv)
+			resuming = true
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	w := newFileWatcher(s, gvk)
-	s.watchers[gvk] = append(s.watchers[gvk], w)
+	var replay []reconkit.Event
+	if resuming {
+		replay, err = s.eventsSince(fromRevision, gvk)
+		if err != nil {
+			return nil, err
+		}
+	}
 
+	bufSize := 100
+	if len(replay) > bufSize {
+		bufSize = len(replay) + 100
+	}
+	w := newFileWatcher(s, gvk, bufSize)
+
+	for _, evt := range replay {
+		w.ch <- evt
+	}
+
+	s.watchers[gvk] = append(s.watchers[gvk], w)
 	return w, nil
 }
 
 func (s *FileStore) Apply(_ context.Context, _ runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
 	return fmt.Errorf("apply not supported by the filesystem store backend")
+}
+
+func (s *FileStore) revisionPath() string {
+	return filepath.Join(s.root, ".revision")
+}
+
+func (s *FileStore) loadRevision() {
+	data, err := os.ReadFile(s.revisionPath())
+	if err != nil {
+		return
+	}
+	rv, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return
+	}
+	s.revision.Store(rv)
+}
+
+func (s *FileStore) persistRevision(rv int64) {
+	_ = os.MkdirAll(s.root, 0755)
+	_ = os.WriteFile(s.revisionPath(), []byte(strconv.FormatInt(rv, 10)), 0644)
+}
+
+func (s *FileStore) logEvent(gvk schema.GroupVersionKind, revision int64, event reconkit.Event) {
+	s.eventLog = append(s.eventLog, eventLogEntry{
+		revision: revision,
+		gvk:      gvk,
+		event:    event,
+	})
+	if len(s.eventLog) > s.eventLogMax {
+		excess := len(s.eventLog) - s.eventLogMax
+		trimmed := make([]eventLogEntry, s.eventLogMax)
+		copy(trimmed, s.eventLog[excess:])
+		s.eventLog = trimmed
+	}
+}
+
+func (s *FileStore) eventsSince(fromRevision int64, gvk schema.GroupVersionKind) ([]reconkit.Event, error) {
+	currentRevision := s.revision.Load()
+
+	if fromRevision >= currentRevision {
+		return nil, nil
+	}
+
+	if len(s.eventLog) == 0 {
+		return nil, &reconkit.RevisionTooOldError{
+			RequestedRevision: fromRevision,
+			OldestRevision:    currentRevision + 1,
+		}
+	}
+
+	oldest := s.eventLog[0].revision
+	if fromRevision+1 < oldest {
+		return nil, &reconkit.RevisionTooOldError{
+			RequestedRevision: fromRevision,
+			OldestRevision:    oldest,
+		}
+	}
+
+	var events []reconkit.Event
+	for _, entry := range s.eventLog {
+		if entry.revision > fromRevision && entry.gvk == gvk {
+			events = append(events, entry.event)
+		}
+	}
+	return events, nil
 }
 
 // --- helpers ---

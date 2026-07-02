@@ -7,6 +7,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+// WatchFromRevision is a client.ListOption that tells Store.Watch to replay
+// events after the given revision before switching to live events.
+// Mirrors the Kubernetes resourceVersion-based watch resumption.
+// If the revision is too old (compacted), the store returns RevisionTooOldError.
+type WatchFromRevision int64
+
+func (w WatchFromRevision) ApplyToList(_ *client.ListOptions) {}
+
 // Store is the interface backend implementations must satisfy.
 // It abstracts the data persistence layer so controllers can work
 // against any datastore (SQL, GCP APIs, in-memory, etc.) instead of
@@ -35,6 +43,11 @@ type Store interface {
 
 	// Watch returns a Watcher that streams change events for the given type.
 	// The list parameter determines the type being watched.
+	//
+	// Backends should check opts for WatchFromRevision. When present, replay
+	// events after that revision before switching to live events. If the
+	// revision has been compacted, return RevisionTooOldError so callers
+	// can relist and restart.
 	Watch(ctx context.Context, list client.ObjectList, opts ...client.ListOption) (Watcher, error)
 
 	// Apply performs a server-side-apply-style patch. The apply configuration

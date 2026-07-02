@@ -2,10 +2,11 @@ package reconkit
 
 import (
 	"context"
-	"fmt"
-	"sync"
-
 	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"sync"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -212,41 +213,96 @@ func (c *storeCache) startInformer(ctx context.Context, informer *storeInformer)
 
 	informer.setSynced(true)
 
-	// Start watch in background
-	go c.watchInformer(ctx, informer, list)
+	// Start watch from the list's resource version to avoid
+	// missing events between list and watch.
+	var listRV int64
+	if getter, ok := list.(interface{ GetResourceVersion() string }); ok {
+		listRV, _ = strconv.ParseInt(getter.GetResourceVersion(), 10, 64)
+	}
+
+	go c.watchInformer(ctx, informer, list, listRV)
 
 	return nil
 }
 
-func (c *storeCache) watchInformer(ctx context.Context, informer *storeInformer, list client.ObjectList) {
-	watcher, err := c.store.Watch(ctx, list)
-	if err != nil {
-		// Log error or handle appropriately
-		return
-	}
-
-	informer.setWatcher(watcher)
+func (c *storeCache) watchInformer(ctx context.Context, informer *storeInformer, list client.ObjectList, initialRV int64) {
+	lastRV := initialRV
 
 	for {
 		select {
 		case <-ctx.Done():
-			watcher.Stop()
 			return
-		case event, ok := <-watcher.ResultChan():
-			if !ok {
-				return
-			}
+		default:
+		}
 
-			switch event.Type {
-			case EventAdded:
-				informer.add(event.Object)
-			case EventModified:
-				informer.update(event.Object)
-			case EventDeleted:
-				informer.delete(event.Object)
+		watcher, err := c.store.Watch(ctx, list, WatchFromRevision(lastRV))
+		if err != nil {
+			var rvErr *RevisionTooOldError
+			if errors.As(err, &rvErr) {
+				if err := c.relistInformer(ctx, informer, list); err != nil {
+					return
+				}
+				if getter, ok := list.(interface{ GetResourceVersion() string }); ok {
+					lastRV, _ = strconv.ParseInt(getter.GetResourceVersion(), 10, 64)
+				} else {
+					lastRV = 0
+				}
+				continue
+			}
+			return
+		}
+
+		informer.setWatcher(watcher)
+
+	eventLoop:
+		for {
+			select {
+			case <-ctx.Done():
+				watcher.Stop()
+				return
+			case event, ok := <-watcher.ResultChan():
+				if !ok {
+					break eventLoop
+				}
+
+				if event.Object != nil {
+					if rv, err := strconv.ParseInt(event.Object.GetResourceVersion(), 10, 64); err == nil && rv > lastRV {
+						lastRV = rv
+					}
+				}
+
+				switch event.Type {
+				case EventAdded:
+					informer.add(event.Object)
+				case EventModified:
+					informer.update(event.Object)
+				case EventDeleted:
+					informer.delete(event.Object)
+				case EventBookmark:
+				}
 			}
 		}
+
+		watcher.Stop()
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
+}
+
+func (c *storeCache) relistInformer(ctx context.Context, informer *storeInformer, list client.ObjectList) error {
+	if err := c.store.List(ctx, list); err != nil {
+		return err
+	}
+	items, err := meta.ExtractList(list)
+	if err != nil {
+		return err
+	}
+	informer.replaceAll(items)
+	return nil
 }
 
 // WaitForCacheSync waits for the cache to be synced.
@@ -557,6 +613,49 @@ func (i *storeInformer) removeFromIndices(key client.ObjectKey) {
 			} else {
 				delete(i.indices[indexName], value)
 			}
+		}
+	}
+}
+
+func (i *storeInformer) replaceAll(items []runtime.Object) {
+	i.mu.Lock()
+	oldObjects := i.objects
+	i.objects = make(map[client.ObjectKey]client.Object, len(items))
+	for _, item := range items {
+		obj, ok := item.(client.Object)
+		if !ok {
+			continue
+		}
+		key := client.ObjectKeyFromObject(obj)
+		i.objects[key] = obj.DeepCopyObject().(client.Object)
+	}
+	for indexName := range i.indices {
+		i.indices[indexName] = make(map[string][]client.ObjectKey)
+	}
+	for key, obj := range i.objects {
+		i.rebuildIndicesForObject(key, obj)
+	}
+	newObjects := i.objects
+	i.mu.Unlock()
+
+	i.handlerMu.RLock()
+	handlers := make([]toolscache.ResourceEventHandler, len(i.handlers))
+	for idx, h := range i.handlers {
+		handlers[idx] = h.handler
+	}
+	i.handlerMu.RUnlock()
+
+	for key, obj := range oldObjects {
+		if _, exists := newObjects[key]; !exists {
+			for _, h := range handlers {
+				h.OnDelete(obj)
+			}
+		}
+	}
+
+	for _, obj := range newObjects {
+		for _, h := range handlers {
+			h.OnAdd(obj, true)
 		}
 	}
 }

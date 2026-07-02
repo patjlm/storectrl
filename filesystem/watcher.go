@@ -2,7 +2,6 @@ package filesystem
 
 import (
 	"sync"
-	"sync/atomic"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
@@ -10,19 +9,18 @@ import (
 )
 
 type fileWatcher struct {
-	store    *FileStore
-	gvk      schema.GroupVersionKind
-	ch       chan reconkit.Event
-	stopped  atomic.Bool
-	stopMu   sync.Mutex
-	stopOnce sync.Once
+	store  *FileStore
+	gvk    schema.GroupVersionKind
+	ch     chan reconkit.Event
+	mu     sync.Mutex
+	closed bool
 }
 
-func newFileWatcher(store *FileStore, gvk schema.GroupVersionKind) *fileWatcher {
+func newFileWatcher(store *FileStore, gvk schema.GroupVersionKind, bufSize int) *fileWatcher {
 	return &fileWatcher{
 		store: store,
 		gvk:   gvk,
-		ch:    make(chan reconkit.Event, 100),
+		ch:    make(chan reconkit.Event, bufSize),
 	}
 }
 
@@ -31,26 +29,34 @@ func (w *fileWatcher) ResultChan() <-chan reconkit.Event {
 }
 
 func (w *fileWatcher) Stop() {
-	w.stopOnce.Do(func() {
-		w.stopped.Store(true)
-		w.stopMu.Lock()
+	w.mu.Lock()
+	if !w.closed {
+		w.closed = true
 		close(w.ch)
-		w.stopMu.Unlock()
-		w.store.removeWatcher(w.gvk, w)
-	})
+	}
+	w.mu.Unlock()
+
+	w.store.removeWatcher(w.gvk, w)
 }
 
 func (w *fileWatcher) isStopped() bool {
-	return w.stopped.Load()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.closed
 }
 
 func (w *fileWatcher) send(event reconkit.Event) {
-	if w.isStopped() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
 		return
 	}
 
 	select {
 	case w.ch <- event:
 	default:
+		w.closed = true
+		close(w.ch)
 	}
 }

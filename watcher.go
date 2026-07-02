@@ -11,6 +11,7 @@ const (
 	EventAdded    EventType = "ADDED"
 	EventModified EventType = "MODIFIED"
 	EventDeleted  EventType = "DELETED"
+	EventBookmark EventType = "BOOKMARK"
 )
 
 // Event represents a change to an object in the Store.

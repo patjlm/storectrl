@@ -2,68 +2,64 @@ package memory
 
 import (
 	"sync"
-	"sync/atomic"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"reconkit"
 )
 
-// memoryWatcher implements reconkit.Watcher for the in-memory store.
 type memoryWatcher struct {
-	store    *MemoryStore
-	gvk      schema.GroupVersionKind
-	ch       chan reconkit.Event
-	stopped  atomic.Bool
-	stopMu   sync.Mutex
-	stopOnce sync.Once
+	store  *MemoryStore
+	gvk    schema.GroupVersionKind
+	ch     chan reconkit.Event
+	mu     sync.Mutex
+	closed bool
 }
 
-// newMemoryWatcher creates a new watcher for the given GVK.
-func newMemoryWatcher(store *MemoryStore, gvk schema.GroupVersionKind) *memoryWatcher {
+func newMemoryWatcher(store *MemoryStore, gvk schema.GroupVersionKind, bufSize int) *memoryWatcher {
 	return &memoryWatcher{
 		store: store,
 		gvk:   gvk,
-		ch:    make(chan reconkit.Event, 100),
+		ch:    make(chan reconkit.Event, bufSize),
 	}
 }
 
-// ResultChan returns the channel for receiving watch events.
 func (w *memoryWatcher) ResultChan() <-chan reconkit.Event {
 	return w.ch
 }
 
-// Stop closes the watcher and stops sending events.
 func (w *memoryWatcher) Stop() {
-	w.stopOnce.Do(func() {
-		w.stopped.Store(true)
-		w.stopMu.Lock()
+	w.mu.Lock()
+	if !w.closed {
+		w.closed = true
 		close(w.ch)
-		w.stopMu.Unlock()
+	}
+	w.mu.Unlock()
 
-		// Remove this watcher from the store
-		w.store.removeWatcher(w.gvk, w)
-	})
+	w.store.removeWatcher(w.gvk, w)
 }
 
-// isStopped returns whether the watcher has been stopped.
 func (w *memoryWatcher) isStopped() bool {
-	return w.stopped.Load()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.closed
 }
 
-// send sends an event to the watcher's channel.
-// It is non-blocking and will drop events if the channel is full or the watcher is stopped.
+// send delivers an event to the watcher. If the channel buffer is full,
+// the watcher is closed so the consumer can reconnect with WatchFromRevision
+// and replay missed events from the store's event log.
 func (w *memoryWatcher) send(event reconkit.Event) {
-	if w.isStopped() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
 		return
 	}
 
-	// Non-blocking send
 	select {
 	case w.ch <- event:
-		// Event sent successfully
 	default:
-		// Channel full, drop the event
-		// In a production implementation, you might want to log this
+		w.closed = true
+		close(w.ch)
 	}
 }

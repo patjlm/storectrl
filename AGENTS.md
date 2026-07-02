@@ -10,9 +10,9 @@ reconkit is a Go library that reimplements controller-runtime's core interfaces 
 
 ```
 reconkit/                 # Main package — all public API
-├── store.go              # Store interface (the backend contract)
-├── watcher.go            # Watcher, Event, EventType
-├── errors.go             # NotFoundError, AlreadyExistsError, ConflictError (apierrors-compatible)
+├── store.go              # Store interface, WatchFromRevision option
+├── watcher.go            # Watcher, Event, EventType (incl. EventBookmark)
+├── errors.go             # NotFoundError, AlreadyExistsError, ConflictError, RevisionTooOldError
 ├── object.go             # BaseObject, BaseList (embed for client.Object compat)
 ├── client.go             # client.Client implementation wrapping Store
 ├── cache.go              # cache.Cache implementation (watch-backed in-memory cache)
@@ -21,9 +21,12 @@ reconkit/                 # Main package — all public API
 ├── builder.go            # Fluent controller builder (NewControllerManagedBy)
 ├── example_test.go       # CRUD, concurrency, and reconciler tests
 ├── docs/migration.md     # Migration guide from controller-runtime
-└── memory/               # In-memory Store backend
-    ├── store.go           # MemoryStore — map-based storage with optimistic concurrency
-    └── watcher.go         # memoryWatcher — buffered channel fan-out
+├── memory/               # In-memory Store backend
+│   ├── store.go           # MemoryStore — global revision, event log, watch resumption
+│   └── watcher.go         # memoryWatcher — overflow-closes-watch for safe reconnect
+└── filesystem/            # Filesystem Store backend
+    ├── store.go           # FileStore — JSON files, persisted revision counter
+    └── watcher.go         # fileWatcher — same overflow pattern as memory
 ```
 
 ## Key interfaces
@@ -32,7 +35,14 @@ reconkit/                 # Main package — all public API
 
 The **only interface backend authors implement**. Seven methods: Get, List, Create, Update, Delete, Watch, Apply. Everything else (Client, Cache, Manager) is built on top.
 
-Error contract matters: return `*NotFoundError`, `*AlreadyExistsError`, `*ConflictError` so that `apierrors.IsNotFound()` etc. work. These types implement `APIStatus`.
+Error contract matters: return `*NotFoundError`, `*AlreadyExistsError`, `*ConflictError`, `*RevisionTooOldError` so that `apierrors.IsNotFound()` etc. work. These types implement `APIStatus`.
+
+**Watch resumption contract:** backends must check opts for `WatchFromRevision`. When present, replay events that occurred after that revision before switching to live delivery. If the requested revision has been compacted out of the backend's event history, return `*RevisionTooOldError` (410 Gone equivalent) — the cache layer handles this by doing a full relist. Backends own their revision counter and event log; see `memory/store.go` as reference. Key points:
+
+- Use a global monotonic revision counter (not per-object) — every mutation gets a unique revision used as the object's ResourceVersion
+- Maintain a bounded event log for replay (configurable via `WithEventLogSize`)
+- `List` must set the list's ResourceVersion to the current global revision so callers can start a watch from that point without a gap
+- When a watcher's channel buffer overflows, close the watch (not silently drop events) so the consumer can reconnect and replay from the event log
 
 Apply is backend-decided: backends that support server-side-apply-style merges implement real logic; others return a clear error.
 
@@ -78,10 +88,13 @@ Do not run `go test`, `go vet`, or `gofmt` directly — the Makefile targets inc
 2. Implement `reconkit.Store` — see `memory/store.go` as reference
 3. Pay attention to:
    - Thread safety (Store must be safe for concurrent use)
-   - Setting `UID` and `ResourceVersion` on Create
+   - Setting `UID` and `ResourceVersion` on Create (use a global monotonic revision counter, not per-object)
    - Checking `ResourceVersion` on Update (optimistic concurrency)
    - Deep-copying objects before storing (callers may mutate after Create/Update)
-   - Watch implementation (how change notifications work for your backend)
+   - Watch resumption: check opts for `WatchFromRevision`, replay events from an event log, return `*RevisionTooOldError` if the revision is compacted
+   - List must set the list's `ResourceVersion` to the current global revision
+   - When a watcher's channel buffer is full, close the watch (not silently drop) so consumers can reconnect and replay
+   - Persist the revision counter if the backend survives restarts (see `filesystem/store.go` `.revision` file)
 4. Add tests using the same patterns as `example_test.go`
 
 ### Modifying controller-runtime interface implementations

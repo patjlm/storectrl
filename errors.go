@@ -66,3 +66,24 @@ func (e *ConflictError) Status() metav1.Status {
 		Code:    409,
 	}
 }
+
+// RevisionTooOldError indicates the requested watch revision has been
+// compacted out of the event log — equivalent to HTTP 410 Gone in the
+// Kubernetes API. Callers should relist and restart the watch.
+type RevisionTooOldError struct {
+	RequestedRevision int64
+	OldestRevision    int64
+}
+
+func (e *RevisionTooOldError) Error() string {
+	return fmt.Sprintf("requested revision %d is too old, oldest available is %d", e.RequestedRevision, e.OldestRevision)
+}
+
+func (e *RevisionTooOldError) Status() metav1.Status {
+	return metav1.Status{
+		Status:  metav1.StatusFailure,
+		Reason:  metav1.StatusReasonGone,
+		Message: e.Error(),
+		Code:    410,
+	}
+}
