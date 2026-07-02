@@ -5,13 +5,13 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	"github.com/patjlm/ctrlforge"
+	"github.com/patjlm/storectrl"
 )
 
 type memoryWatcher struct {
 	store  *MemoryStore
 	gvk    schema.GroupVersionKind
-	ch     chan ctrlforge.Event
+	ch     chan storectrl.Event
 	mu     sync.Mutex
 	closed bool
 }
@@ -20,11 +20,11 @@ func newMemoryWatcher(store *MemoryStore, gvk schema.GroupVersionKind, bufSize i
 	return &memoryWatcher{
 		store: store,
 		gvk:   gvk,
-		ch:    make(chan ctrlforge.Event, bufSize),
+		ch:    make(chan storectrl.Event, bufSize),
 	}
 }
 
-func (w *memoryWatcher) ResultChan() <-chan ctrlforge.Event {
+func (w *memoryWatcher) ResultChan() <-chan storectrl.Event {
 	return w.ch
 }
 
@@ -48,7 +48,7 @@ func (w *memoryWatcher) isStopped() bool {
 // send delivers an event to the watcher. If the channel buffer is full,
 // the watcher is closed so the consumer can reconnect with WatchFromRevision
 // and replay missed events from the store's event log.
-func (w *memoryWatcher) send(event ctrlforge.Event) {
+func (w *memoryWatcher) send(event storectrl.Event) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 

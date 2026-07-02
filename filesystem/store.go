@@ -18,7 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/patjlm/ctrlforge"
+	"github.com/patjlm/storectrl"
 )
 
 const defaultEventLogSize = 1000
@@ -26,7 +26,7 @@ const defaultEventLogSize = 1000
 type eventLogEntry struct {
 	revision int64
 	gvk      schema.GroupVersionKind
-	event    ctrlforge.Event
+	event    storectrl.Event
 }
 
 // StoreOption configures a FileStore.
@@ -40,7 +40,7 @@ func WithEventLogSize(size int) StoreOption {
 	}
 }
 
-// FileStore is a filesystem-backed implementation of ctrlforge.Store.
+// FileStore is a filesystem-backed implementation of storectrl.Store.
 // Objects are stored as JSON files organized by GVK, namespace, and name:
 //
 //	<root>/<group>/<version>/<kind>/<namespace>/<name>.json
@@ -86,7 +86,7 @@ func (s *FileStore) Get(ctx context.Context, key client.ObjectKey, obj client.Ob
 	data, err := os.ReadFile(objectPath(s.root, gvk, key))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return &ctrlforge.NotFoundError{Key: key.String()}
+			return &storectrl.NotFoundError{Key: key.String()}
 		}
 		return err
 	}
@@ -197,7 +197,7 @@ func (s *FileStore) Create(ctx context.Context, obj client.Object) error {
 	path := objectPath(s.root, gvk, key)
 
 	if _, err := os.Stat(path); err == nil {
-		return &ctrlforge.AlreadyExistsError{Key: key.String()}
+		return &storectrl.AlreadyExistsError{Key: key.String()}
 	}
 
 	accessor, err := meta.Accessor(obj)
@@ -227,8 +227,8 @@ func (s *FileStore) Create(ctx context.Context, obj client.Object) error {
 
 	s.persistRevision(rv)
 
-	event := ctrlforge.Event{
-		Type:   ctrlforge.EventAdded,
+	event := storectrl.Event{
+		Type:   storectrl.EventAdded,
 		Object: obj.DeepCopyObject().(client.Object),
 	}
 	s.logEvent(gvk, rv, event)
@@ -253,7 +253,7 @@ func (s *FileStore) Update(ctx context.Context, obj client.Object) error {
 	existing, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return &ctrlforge.NotFoundError{Key: key.String()}
+			return &storectrl.NotFoundError{Key: key.String()}
 		}
 		return err
 	}
@@ -276,7 +276,7 @@ func (s *FileStore) Update(ctx context.Context, obj client.Object) error {
 	}
 
 	if objAccessor.GetResourceVersion() != storedAccessor.GetResourceVersion() {
-		return &ctrlforge.ConflictError{Key: key.String()}
+		return &storectrl.ConflictError{Key: key.String()}
 	}
 
 	rv := s.revision.Add(1)
@@ -293,8 +293,8 @@ func (s *FileStore) Update(ctx context.Context, obj client.Object) error {
 
 	s.persistRevision(rv)
 
-	event := ctrlforge.Event{
-		Type:   ctrlforge.EventModified,
+	event := storectrl.Event{
+		Type:   storectrl.EventModified,
 		Object: obj.DeepCopyObject().(client.Object),
 	}
 	s.logEvent(gvk, rv, event)
@@ -319,7 +319,7 @@ func (s *FileStore) Delete(ctx context.Context, obj client.Object) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return &ctrlforge.NotFoundError{Key: key.String()}
+			return &storectrl.NotFoundError{Key: key.String()}
 		}
 		return err
 	}
@@ -346,8 +346,8 @@ func (s *FileStore) Delete(ctx context.Context, obj client.Object) error {
 	s.persistRevision(rv)
 	deletedAccessor.SetResourceVersion(strconv.FormatInt(rv, 10))
 
-	event := ctrlforge.Event{
-		Type:   ctrlforge.EventDeleted,
+	event := storectrl.Event{
+		Type:   storectrl.EventDeleted,
 		Object: deletedObj,
 	}
 	s.logEvent(gvk, rv, event)
@@ -356,7 +356,7 @@ func (s *FileStore) Delete(ctx context.Context, obj client.Object) error {
 	return nil
 }
 
-func (s *FileStore) Watch(ctx context.Context, list client.ObjectList, opts ...client.ListOption) (ctrlforge.Watcher, error) {
+func (s *FileStore) Watch(ctx context.Context, list client.ObjectList, opts ...client.ListOption) (storectrl.Watcher, error) {
 	gvk, err := s.gvkForList(list)
 	if err != nil {
 		return nil, err
@@ -365,7 +365,7 @@ func (s *FileStore) Watch(ctx context.Context, list client.ObjectList, opts ...c
 	var fromRevision int64
 	resuming := false
 	for _, opt := range opts {
-		if rv, ok := opt.(ctrlforge.WatchFromRevision); ok {
+		if rv, ok := opt.(storectrl.WatchFromRevision); ok {
 			fromRevision = int64(rv)
 			resuming = true
 		}
@@ -374,7 +374,7 @@ func (s *FileStore) Watch(ctx context.Context, list client.ObjectList, opts ...c
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var replay []ctrlforge.Event
+	var replay []storectrl.Event
 	if resuming {
 		replay, err = s.eventsSince(fromRevision, gvk)
 		if err != nil {
@@ -421,7 +421,7 @@ func (s *FileStore) persistRevision(rv int64) {
 	_ = os.WriteFile(s.revisionPath(), []byte(strconv.FormatInt(rv, 10)), 0644)
 }
 
-func (s *FileStore) logEvent(gvk schema.GroupVersionKind, revision int64, event ctrlforge.Event) {
+func (s *FileStore) logEvent(gvk schema.GroupVersionKind, revision int64, event storectrl.Event) {
 	s.eventLog = append(s.eventLog, eventLogEntry{
 		revision: revision,
 		gvk:      gvk,
@@ -435,7 +435,7 @@ func (s *FileStore) logEvent(gvk schema.GroupVersionKind, revision int64, event 
 	}
 }
 
-func (s *FileStore) eventsSince(fromRevision int64, gvk schema.GroupVersionKind) ([]ctrlforge.Event, error) {
+func (s *FileStore) eventsSince(fromRevision int64, gvk schema.GroupVersionKind) ([]storectrl.Event, error) {
 	currentRevision := s.revision.Load()
 
 	if fromRevision >= currentRevision {
@@ -443,7 +443,7 @@ func (s *FileStore) eventsSince(fromRevision int64, gvk schema.GroupVersionKind)
 	}
 
 	if len(s.eventLog) == 0 {
-		return nil, &ctrlforge.RevisionTooOldError{
+		return nil, &storectrl.RevisionTooOldError{
 			RequestedRevision: fromRevision,
 			OldestRevision:    currentRevision + 1,
 		}
@@ -451,13 +451,13 @@ func (s *FileStore) eventsSince(fromRevision int64, gvk schema.GroupVersionKind)
 
 	oldest := s.eventLog[0].revision
 	if fromRevision+1 < oldest {
-		return nil, &ctrlforge.RevisionTooOldError{
+		return nil, &storectrl.RevisionTooOldError{
 			RequestedRevision: fromRevision,
 			OldestRevision:    oldest,
 		}
 	}
 
-	var events []ctrlforge.Event
+	var events []storectrl.Event
 	for _, entry := range s.eventLog {
 		if entry.revision > fromRevision && entry.gvk == gvk {
 			events = append(events, entry.event)
@@ -544,7 +544,7 @@ func (s *FileStore) generateUID() string {
 	return fmt.Sprintf("uid-%d", id)
 }
 
-func (s *FileStore) notifyWatchers(gvk schema.GroupVersionKind, event ctrlforge.Event) {
+func (s *FileStore) notifyWatchers(gvk schema.GroupVersionKind, event storectrl.Event) {
 	watchers := s.watchers[gvk]
 	active := make([]*fileWatcher, 0, len(watchers))
 	for _, w := range watchers {

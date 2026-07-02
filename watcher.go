@@ -1,4 +1,4 @@
-package ctrlforge
+package storectrl
 
 import (
 	"sigs.k8s.io/controller-runtime/pkg/client"

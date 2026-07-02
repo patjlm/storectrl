@@ -1,12 +1,12 @@
-# Migrating to ctrlforge
+# Migrating to storectrl
 
 ## Overview
 
-ctrlforge is a component library that provides `client.Client` and `cache.Cache` implementations backed by a pluggable `Store` interface. It does not replace controller-runtime -- it plugs into it. You keep your standard `ctrl.NewManager` setup and override two factory functions.
+storectrl is a component library that provides `client.Client` and `cache.Cache` implementations backed by a pluggable `Store` interface. It does not replace controller-runtime -- it plugs into it. You keep your standard `ctrl.NewManager` setup and override two factory functions.
 
-### When to Use ctrlforge
+### When to Use storectrl
 
-Use ctrlforge when you want controllers that reconcile against non-Kubernetes backends (SQL, GCP APIs, in-memory, etc.) while keeping the standard controller-runtime reconciler pattern, lifecycle management, and operational features.
+Use storectrl when you want controllers that reconcile against non-Kubernetes backends (SQL, GCP APIs, in-memory, etc.) while keeping the standard controller-runtime reconciler pattern, lifecycle management, and operational features.
 
 ## Migration: Two Factory Overrides
 
@@ -18,7 +18,7 @@ mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 })
 ```
 
-### After: ctrlforge-backed
+### After: storectrl-backed
 
 ```go
 store := memory.NewStore(scheme) // or your custom Store implementation
@@ -26,10 +26,10 @@ store := memory.NewStore(scheme) // or your custom Store implementation
 mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
     Scheme: scheme,
     NewCache: func(cfg *rest.Config, opts cache.Options) (cache.Cache, error) {
-        return ctrlforge.NewCache(store, scheme), nil
+        return storectrl.NewCache(store, scheme), nil
     },
     NewClient: func(c cache.Cache, cfg *rest.Config, opts client.Options, uncachedObjects ...client.Object) (client.Client, error) {
-        return ctrlforge.NewClient(store, scheme), nil
+        return storectrl.NewClient(store, scheme), nil
     },
 })
 ```
@@ -38,7 +38,7 @@ Everything else stays the same -- controller setup, reconciler code, `mgr.Start(
 
 ### What You Keep from controller-runtime
 
-Because ctrlforge plugs into the standard manager, you get all of its operational features for free:
+Because storectrl plugs into the standard manager, you get all of its operational features for free:
 
 - Leader election via Kubernetes Leases
 - Metrics server (Prometheus)
@@ -49,13 +49,13 @@ Because ctrlforge plugs into the standard manager, you get all of its operationa
 
 ## Making Your Types Compatible
 
-Types must implement `client.Object`. ctrlforge provides helpers.
+Types must implement `client.Object`. storectrl provides helpers.
 
-### Option A: Embed ctrlforge.BaseObject (Recommended)
+### Option A: Embed storectrl.BaseObject (Recommended)
 
 ```go
 type Widget struct {
-    ctrlforge.BaseObject `json:",inline"`
+    storectrl.BaseObject `json:",inline"`
 
     Spec   WidgetSpec   `json:"spec"`
     Status WidgetStatus `json:"status"`
@@ -80,11 +80,11 @@ If your types already embed `metav1.TypeMeta` and `metav1.ObjectMeta`, they work
 
 ### List Types
 
-Every object type needs a corresponding list type. Embed `ctrlforge.BaseList`:
+Every object type needs a corresponding list type. Embed `storectrl.BaseList`:
 
 ```go
 type WidgetList struct {
-    ctrlforge.BaseList `json:",inline"`
+    storectrl.BaseList `json:",inline"`
     Items              []Widget `json:"items"`
 }
 
@@ -127,7 +127,7 @@ func (r *WidgetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
     widget := &Widget{}
 
     if err := r.Get(ctx, req.NamespacedName, widget); err != nil {
-        if errors.IsNotFound(err) {  // Works -- ctrlforge errors implement APIStatus
+        if errors.IsNotFound(err) {  // Works -- storectrl errors implement APIStatus
             return ctrl.Result{}, nil
         }
         return ctrl.Result{}, err
@@ -148,7 +148,7 @@ func (r *WidgetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 ## Writing a Custom Store Backend
 
-Implement the `Store` interface to connect ctrlforge to your backend:
+Implement the `Store` interface to connect storectrl to your backend:
 
 ```go
 type Store interface {
@@ -176,7 +176,7 @@ See `memory/store.go` as a reference implementation. Key requirements:
 
 ## Limitations
 
-ctrlforge provides `client.Client` and `cache.Cache` -- not a full Kubernetes API server. Some behavioral differences remain:
+storectrl provides `client.Client` and `cache.Cache` -- not a full Kubernetes API server. Some behavioral differences remain:
 
 - **Subresources**: Only `status` is supported. Custom subresources like `scale` are no-ops.
 - **Owner references / GC**: Setting owner references works, but cascade deletion is not automatic.
@@ -185,7 +185,7 @@ ctrlforge provides `client.Client` and `cache.Cache` -- not a full Kubernetes AP
 
 ## Next Steps
 
-1. Define your domain types using `ctrlforge.BaseObject` and `ctrlforge.BaseList`
+1. Define your domain types using `storectrl.BaseObject` and `storectrl.BaseList`
 2. Register them with a scheme
 3. Implement a `Store` for your backend (or use `memory.NewStore` for testing)
 4. Add the two factory overrides to your `ctrl.Options`

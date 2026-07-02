@@ -1,4 +1,4 @@
-module github.com/patjlm/ctrlforge
+module github.com/patjlm/storectrl
 
 go 1.26.0
 

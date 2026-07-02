@@ -15,7 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/patjlm/ctrlforge"
+	"github.com/patjlm/storectrl"
 )
 
 const defaultEventLogSize = 1000
@@ -23,7 +23,7 @@ const defaultEventLogSize = 1000
 type eventLogEntry struct {
 	revision int64
 	gvk      schema.GroupVersionKind
-	event    ctrlforge.Event
+	event    storectrl.Event
 }
 
 // StoreOption configures a MemoryStore.
@@ -37,7 +37,7 @@ func WithEventLogSize(size int) StoreOption {
 	}
 }
 
-// MemoryStore is an in-memory implementation of ctrlforge.Store.
+// MemoryStore is an in-memory implementation of storectrl.Store.
 // It stores objects in memory organized by GVK and ObjectKey,
 // and supports watching for changes.
 type MemoryStore struct {
@@ -84,12 +84,12 @@ func (s *MemoryStore) Get(ctx context.Context, key client.ObjectKey, obj client.
 
 	gvkMap, exists := s.objects[gvk]
 	if !exists {
-		return &ctrlforge.NotFoundError{Key: key.String()}
+		return &storectrl.NotFoundError{Key: key.String()}
 	}
 
 	stored, exists := gvkMap[key]
 	if !exists {
-		return &ctrlforge.NotFoundError{Key: key.String()}
+		return &storectrl.NotFoundError{Key: key.String()}
 	}
 
 	// Deep copy via JSON round-trip
@@ -170,7 +170,7 @@ func (s *MemoryStore) Create(ctx context.Context, obj client.Object) error {
 	}
 
 	if _, exists := gvkMap[key]; exists {
-		return &ctrlforge.AlreadyExistsError{Key: key.String()}
+		return &storectrl.AlreadyExistsError{Key: key.String()}
 	}
 
 	// Set metadata
@@ -191,8 +191,8 @@ func (s *MemoryStore) Create(ctx context.Context, obj client.Object) error {
 	stored := obj.DeepCopyObject().(client.Object)
 	gvkMap[key] = stored
 
-	event := ctrlforge.Event{
-		Type:   ctrlforge.EventAdded,
+	event := storectrl.Event{
+		Type:   storectrl.EventAdded,
 		Object: stored.DeepCopyObject().(client.Object),
 	}
 	s.logEvent(gvk, rv, event)
@@ -216,12 +216,12 @@ func (s *MemoryStore) Update(ctx context.Context, obj client.Object) error {
 
 	gvkMap, exists := s.objects[gvk]
 	if !exists {
-		return &ctrlforge.NotFoundError{Key: key.String()}
+		return &storectrl.NotFoundError{Key: key.String()}
 	}
 
 	stored, exists := gvkMap[key]
 	if !exists {
-		return &ctrlforge.NotFoundError{Key: key.String()}
+		return &storectrl.NotFoundError{Key: key.String()}
 	}
 
 	// Check resource version
@@ -236,7 +236,7 @@ func (s *MemoryStore) Update(ctx context.Context, obj client.Object) error {
 	}
 
 	if objAccessor.GetResourceVersion() != storedAccessor.GetResourceVersion() {
-		return &ctrlforge.ConflictError{Key: key.String()}
+		return &storectrl.ConflictError{Key: key.String()}
 	}
 
 	rv := s.revision.Add(1)
@@ -246,8 +246,8 @@ func (s *MemoryStore) Update(ctx context.Context, obj client.Object) error {
 	updated := obj.DeepCopyObject().(client.Object)
 	gvkMap[key] = updated
 
-	event := ctrlforge.Event{
-		Type:   ctrlforge.EventModified,
+	event := storectrl.Event{
+		Type:   storectrl.EventModified,
 		Object: updated.DeepCopyObject().(client.Object),
 	}
 	s.logEvent(gvk, rv, event)
@@ -271,12 +271,12 @@ func (s *MemoryStore) Delete(ctx context.Context, obj client.Object) error {
 
 	gvkMap, exists := s.objects[gvk]
 	if !exists {
-		return &ctrlforge.NotFoundError{Key: key.String()}
+		return &storectrl.NotFoundError{Key: key.String()}
 	}
 
 	stored, exists := gvkMap[key]
 	if !exists {
-		return &ctrlforge.NotFoundError{Key: key.String()}
+		return &storectrl.NotFoundError{Key: key.String()}
 	}
 
 	delete(gvkMap, key)
@@ -290,8 +290,8 @@ func (s *MemoryStore) Delete(ctx context.Context, obj client.Object) error {
 	rv := s.revision.Add(1)
 	deletedAccessor.SetResourceVersion(strconv.FormatInt(rv, 10))
 
-	event := ctrlforge.Event{
-		Type:   ctrlforge.EventDeleted,
+	event := storectrl.Event{
+		Type:   storectrl.EventDeleted,
 		Object: deletedCopy,
 	}
 	s.logEvent(gvk, rv, event)
@@ -304,7 +304,7 @@ func (s *MemoryStore) Delete(ctx context.Context, obj client.Object) error {
 // If WatchFromRevision is passed in opts, events after that revision are
 // replayed from the event log before live events begin. Returns
 // RevisionTooOldError if the requested revision has been compacted.
-func (s *MemoryStore) Watch(ctx context.Context, list client.ObjectList, opts ...client.ListOption) (ctrlforge.Watcher, error) {
+func (s *MemoryStore) Watch(ctx context.Context, list client.ObjectList, opts ...client.ListOption) (storectrl.Watcher, error) {
 	gvk, err := s.gvkForList(list)
 	if err != nil {
 		return nil, err
@@ -313,7 +313,7 @@ func (s *MemoryStore) Watch(ctx context.Context, list client.ObjectList, opts ..
 	var fromRevision int64
 	resuming := false
 	for _, opt := range opts {
-		if rv, ok := opt.(ctrlforge.WatchFromRevision); ok {
+		if rv, ok := opt.(storectrl.WatchFromRevision); ok {
 			fromRevision = int64(rv)
 			resuming = true
 		}
@@ -322,7 +322,7 @@ func (s *MemoryStore) Watch(ctx context.Context, list client.ObjectList, opts ..
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var replay []ctrlforge.Event
+	var replay []storectrl.Event
 	if resuming {
 		replay, err = s.eventsSince(fromRevision, gvk)
 		if err != nil {
@@ -418,7 +418,7 @@ func (s *MemoryStore) generateUID() string {
 	return fmt.Sprintf("uid-%d", id)
 }
 
-func (s *MemoryStore) notifyWatchers(gvk schema.GroupVersionKind, event ctrlforge.Event) {
+func (s *MemoryStore) notifyWatchers(gvk schema.GroupVersionKind, event storectrl.Event) {
 	watchers := s.watchers[gvk]
 
 	// Clean up stopped watchers
@@ -468,7 +468,7 @@ func toLabelSet(labels map[string]string) labelSet {
 	return labelSet(labels)
 }
 
-func (s *MemoryStore) logEvent(gvk schema.GroupVersionKind, revision int64, event ctrlforge.Event) {
+func (s *MemoryStore) logEvent(gvk schema.GroupVersionKind, revision int64, event storectrl.Event) {
 	s.eventLog = append(s.eventLog, eventLogEntry{
 		revision: revision,
 		gvk:      gvk,
@@ -484,7 +484,7 @@ func (s *MemoryStore) logEvent(gvk schema.GroupVersionKind, revision int64, even
 
 // eventsSince returns events for the given GVK after fromRevision.
 // Must be called under s.mu.
-func (s *MemoryStore) eventsSince(fromRevision int64, gvk schema.GroupVersionKind) ([]ctrlforge.Event, error) {
+func (s *MemoryStore) eventsSince(fromRevision int64, gvk schema.GroupVersionKind) ([]storectrl.Event, error) {
 	currentRevision := s.revision.Load()
 
 	if fromRevision >= currentRevision {
@@ -492,7 +492,7 @@ func (s *MemoryStore) eventsSince(fromRevision int64, gvk schema.GroupVersionKin
 	}
 
 	if len(s.eventLog) == 0 {
-		return nil, &ctrlforge.RevisionTooOldError{
+		return nil, &storectrl.RevisionTooOldError{
 			RequestedRevision: fromRevision,
 			OldestRevision:    currentRevision + 1,
 		}
@@ -500,13 +500,13 @@ func (s *MemoryStore) eventsSince(fromRevision int64, gvk schema.GroupVersionKin
 
 	oldest := s.eventLog[0].revision
 	if fromRevision+1 < oldest {
-		return nil, &ctrlforge.RevisionTooOldError{
+		return nil, &storectrl.RevisionTooOldError{
 			RequestedRevision: fromRevision,
 			OldestRevision:    oldest,
 		}
 	}
 
-	var events []ctrlforge.Event
+	var events []storectrl.Event
 	for _, entry := range s.eventLog {
 		if entry.revision > fromRevision && entry.gvk == gvk {
 			events = append(events, entry.event)

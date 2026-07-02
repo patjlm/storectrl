@@ -1,15 +1,15 @@
-# ctrlforge — Agent Guide
+# storectrl — Agent Guide
 
 Instructions for AI agents working on this codebase.
 
 ## What this is
 
-ctrlforge is a Go component library that provides `client.Client` and `cache.Cache` implementations backed by a pluggable `Store` interface instead of the Kubernetes API server. It lets developers write controllers using the standard reconciler pattern against any datastore, wired into controller-runtime's standard `manager.Manager` via factory overrides.
+storectrl is a Go component library that provides `client.Client` and `cache.Cache` implementations backed by a pluggable `Store` interface instead of the Kubernetes API server. It lets developers write controllers using the standard reconciler pattern against any datastore, wired into controller-runtime's standard `manager.Manager` via factory overrides.
 
 ## Module layout
 
 ```
-ctrlforge/                 # Main package — all public API
+storectrl/                 # Main package — all public API
 ├── store.go              # Store interface, WatchFromRevision option
 ├── watcher.go            # Watcher, Event, EventType (incl. EventBookmark)
 ├── errors.go             # NotFoundError, AlreadyExistsError, ConflictError, RevisionTooOldError
@@ -61,7 +61,7 @@ Convenience embeds. `BaseObject` = `metav1.TypeMeta` + `metav1.ObjectMeta`. Type
 
 4. **Cache is watch-backed.** `storeCache` calls `Store.List` for initial sync, then `Store.Watch` for incremental updates. Reads go to the in-memory cache, not the store. Field indexers work the same as controller-runtime.
 
-5. **Component library, not a manager replacement.** ctrlforge provides `NewCache` and `NewClient` factory functions. Users wire these into controller-runtime's standard `manager.Manager` via `manager.Options` factory overrides (`NewCache`, `NewClient`). Manager lifecycle, leader election, health probes, and controller builder all stay with controller-runtime.
+5. **Component library, not a manager replacement.** storectrl provides `NewCache` and `NewClient` factory functions. Users wire these into controller-runtime's standard `manager.Manager` via `manager.Options` factory overrides (`NewCache`, `NewClient`). Manager lifecycle, leader election, health probes, and controller builder all stay with controller-runtime.
 
 ## Working with this code
 
@@ -81,8 +81,8 @@ Do not run `go test`, `go vet`, or `gofmt` directly — the Makefile targets inc
 
 ### Adding a new Store backend
 
-1. Create a new package (e.g., `ctrlforge/sql`)
-2. Implement `ctrlforge.Store` — see `memory/store.go` as reference
+1. Create a new package (e.g., `storectrl/sql`)
+2. Implement `storectrl.Store` — see `memory/store.go` as reference
 3. Pay attention to:
    - Thread safety (Store must be safe for concurrent use)
    - Setting `UID` and `ResourceVersion` on Create (use a global monotonic revision counter, not per-object)
@@ -125,4 +125,4 @@ The interfaces we implement come from controller-runtime and evolve across versi
 - Don't add `Patch` or `DeleteAllOf` to Store — those are composed in `client.go` (Apply is different — it's on Store because backend support varies)
 - Don't break `apierrors.Is*` compatibility — always test error types implement `APIStatus`
 - Don't cache in the Store — that's the cache layer's job
-- Don't add a custom Manager, Builder, or Source — those belong to controller-runtime. ctrlforge plugs in via factory overrides, not by reimplementing lifecycle orchestration
+- Don't add a custom Manager, Builder, or Source — those belong to controller-runtime. storectrl plugs in via factory overrides, not by reimplementing lifecycle orchestration

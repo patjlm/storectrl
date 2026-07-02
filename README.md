@@ -1,6 +1,6 @@
-# ctrlforge
+# storectrl
 
-A Go library that provides pluggable `cache.Cache` and `client.Client` implementations for [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime). Write controllers using the standard reconciler pattern — but store and watch data from any backend, not just the Kubernetes API server. Wire ctrlforge into the standard controller-runtime manager via factory overrides; everything else (leader election, metrics, health probes, graceful shutdown) works out of the box.
+A Go library that provides pluggable `cache.Cache` and `client.Client` implementations for [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime). Write controllers using the standard reconciler pattern — but store and watch data from any backend, not just the Kubernetes API server. Wire storectrl into the standard controller-runtime manager via factory overrides; everything else (leader election, metrics, health probes, graceful shutdown) works out of the box.
 
 ## When to use
 
@@ -27,7 +27,7 @@ func (r *MyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 
 ### 1. Define your types
 
-Embed `ctrlforge.BaseObject` (which provides `TypeMeta` + `ObjectMeta`) and implement `DeepCopyObject`:
+Embed `storectrl.BaseObject` (which provides `TypeMeta` + `ObjectMeta`) and implement `DeepCopyObject`:
 
 ```go
 package mycontroller
@@ -36,13 +36,13 @@ import (
     "k8s.io/apimachinery/pkg/runtime"
     "k8s.io/apimachinery/pkg/runtime/schema"
     metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-    "ctrlforge"
+    "storectrl"
 )
 
 var GroupVersion = schema.GroupVersion{Group: "myapp.example.com", Version: "v1"}
 
 type Cluster struct {
-    ctrlforge.BaseObject `json:",inline"`
+    storectrl.BaseObject `json:",inline"`
     Spec                ClusterSpec   `json:"spec"`
     Status              ClusterStatus `json:"status"`
 }
@@ -66,7 +66,7 @@ func (c *Cluster) DeepCopyObject() runtime.Object {
 }
 
 type ClusterList struct {
-    ctrlforge.BaseList `json:",inline"`
+    storectrl.BaseList `json:",inline"`
     Items             []Cluster `json:"items"`
 }
 
@@ -94,7 +94,7 @@ func NewScheme() *runtime.Scheme {
 
 ### 3. Write the reconciler
 
-Standard controller-runtime reconciler — no ctrlforge-specific code:
+Standard controller-runtime reconciler — no storectrl-specific code:
 
 ```go
 type ClusterReconciler struct {
@@ -124,7 +124,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 ### 4. Wire it up with a store
 
-Plug ctrlforge into the standard controller-runtime manager using the `NewCache` and `NewClient` factory overrides:
+Plug storectrl into the standard controller-runtime manager using the `NewCache` and `NewClient` factory overrides:
 
 ```go
 package main
@@ -137,8 +137,8 @@ import (
     "sigs.k8s.io/controller-runtime/pkg/client"
     "k8s.io/client-go/rest"
 
-    "ctrlforge"
-    "ctrlforge/memory"
+    "storectrl"
+    "storectrl/memory"
 )
 
 func main() {
@@ -150,10 +150,10 @@ func main() {
     mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
         Scheme: scheme,
         NewCache: func(cfg *rest.Config, opts cache.Options) (cache.Cache, error) {
-            return ctrlforge.NewCache(store, scheme), nil
+            return storectrl.NewCache(store, scheme), nil
         },
         NewClient: func(c cache.Cache, cfg *rest.Config, opts client.Options, uncachedObjects ...client.Object) (client.Client, error) {
-            return ctrlforge.NewClient(store, scheme), nil
+            return storectrl.NewClient(store, scheme), nil
         },
     })
     if err != nil {
@@ -188,7 +188,7 @@ type Store interface {
 }
 ```
 
-**Error contract:** Return `*ctrlforge.NotFoundError`, `*ctrlforge.AlreadyExistsError`, or `*ctrlforge.ConflictError` — they implement the `APIStatus` interface so `apierrors.IsNotFound()` etc. work transparently.
+**Error contract:** Return `*storectrl.NotFoundError`, `*storectrl.AlreadyExistsError`, or `*storectrl.ConflictError` — they implement the `APIStatus` interface so `apierrors.IsNotFound()` etc. work transparently.
 
 **Optimistic concurrency:** Check `ResourceVersion` on Update and return `ConflictError` on mismatch. Set `UID` and `ResourceVersion` on Create.
 
@@ -209,14 +209,14 @@ See `memory/store.go` for a complete reference implementation.
 │  Leader election, metrics, health probes, ...     │
 │                                                   │
 │  ┌─────────────┐  ┌──────────┐                   │
-│  │ storeClient │  │storeCache│  ← ctrlforge      │
+│  │ storeClient │  │storeCache│  ← storectrl      │
 │  │(client.Client│  │(cache.   │    components     │
 │  │ impl)       │  │ Cache)   │                    │
 │  └──────┬──────┘  └────┬─────┘                   │
 └─────────┼──────────────┼─────────────────────────┘
           │              │
           └──────┬───────┘
-                 │ ctrlforge.Store interface
+                 │ storectrl.Store interface
     ┌────────────┴────────────────┐
     │    Backend Implementation    │
     │  memory │ SQL │ GCP │ ...   │
@@ -227,8 +227,8 @@ See `memory/store.go` for a complete reference implementation.
 
 | Backend | Package | Status |
 |---------|---------|--------|
-| In-memory | `ctrlforge/memory` | Ready — maps + channels, thread-safe, optimistic concurrency |
-| Filesystem | `ctrlforge/filesystem` | Ready — JSON files, persisted revision counter |
+| In-memory | `storectrl/memory` | Ready — maps + channels, thread-safe, optimistic concurrency |
+| Filesystem | `storectrl/filesystem` | Ready — JSON files, persisted revision counter |
 
 ## Limitations
 

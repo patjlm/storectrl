@@ -1,4 +1,4 @@
-package ctrlforge
+package storectrl
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -14,7 +14,7 @@ import (
 // Example:
 //
 //	type MyResource struct {
-//	    ctrlforge.BaseObject `json:",inline"`
+//	    storectrl.BaseObject `json:",inline"`
 //	    Spec   MyResourceSpec   `json:"spec"`
 //	    Status MyResourceStatus `json:"status"`
 //	}
@@ -43,7 +43,7 @@ func (b *BaseObject) DeepCopyInto(out *BaseObject) {
 // Example:
 //
 //	type MyResourceList struct {
-//	    ctrlforge.BaseList `json:",inline"`
+//	    storectrl.BaseList `json:",inline"`
 //	    Items []MyResource `json:"items"`
 //	}
 type BaseList struct {

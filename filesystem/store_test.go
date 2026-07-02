@@ -13,12 +13,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/patjlm/ctrlforge"
-	"github.com/patjlm/ctrlforge/filesystem"
+	"github.com/patjlm/storectrl"
+	"github.com/patjlm/storectrl/filesystem"
 )
 
 type Widget struct {
-	ctrlforge.BaseObject `json:",inline"`
+	storectrl.BaseObject `json:",inline"`
 	Spec                 WidgetSpec   `json:"spec"`
 	Status               WidgetStatus `json:"status"`
 }
@@ -45,7 +45,7 @@ func (w *Widget) DeepCopyObject() runtime.Object {
 }
 
 type WidgetList struct {
-	ctrlforge.BaseList `json:",inline"`
+	storectrl.BaseList `json:",inline"`
 	Items              []Widget `json:"items"`
 }
 
@@ -64,7 +64,7 @@ func (w *WidgetList) DeepCopyObject() runtime.Object {
 	return out
 }
 
-var widgetGV = schema.GroupVersion{Group: "example.ctrlforge.dev", Version: "v1"}
+var widgetGV = schema.GroupVersion{Group: "example.storectrl.dev", Version: "v1"}
 
 func testScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
@@ -88,7 +88,7 @@ func TestCRUD(t *testing.T) {
 	ctx := context.Background()
 	scheme := testScheme()
 	store := filesystem.NewStore(t.TempDir(), scheme)
-	c := ctrlforge.NewClient(store, scheme)
+	c := storectrl.NewClient(store, scheme)
 
 	widget := newWidget("my-widget", "blue", 42)
 
@@ -160,7 +160,7 @@ func TestOptimisticConcurrency(t *testing.T) {
 	ctx := context.Background()
 	scheme := testScheme()
 	store := filesystem.NewStore(t.TempDir(), scheme)
-	c := ctrlforge.NewClient(store, scheme)
+	c := storectrl.NewClient(store, scheme)
 
 	widget := newWidget("concurrent-widget", "blue", 10)
 	if err := c.Create(ctx, widget); err != nil {
@@ -211,7 +211,7 @@ func TestPersistenceAcrossInstances(t *testing.T) {
 	root := t.TempDir()
 
 	store1 := filesystem.NewStore(root, scheme)
-	c1 := ctrlforge.NewClient(store1, scheme)
+	c1 := storectrl.NewClient(store1, scheme)
 
 	widget := newWidget("persist-me", "purple", 7)
 	if err := c1.Create(ctx, widget); err != nil {
@@ -219,7 +219,7 @@ func TestPersistenceAcrossInstances(t *testing.T) {
 	}
 
 	store2 := filesystem.NewStore(root, scheme)
-	c2 := ctrlforge.NewClient(store2, scheme)
+	c2 := storectrl.NewClient(store2, scheme)
 
 	got := &Widget{}
 	if err := c2.Get(ctx, client.ObjectKeyFromObject(widget), got); err != nil {
@@ -234,14 +234,14 @@ func TestFileLayout(t *testing.T) {
 	root := t.TempDir()
 	scheme := testScheme()
 	store := filesystem.NewStore(root, scheme)
-	c := ctrlforge.NewClient(store, scheme)
+	c := storectrl.NewClient(store, scheme)
 
 	widget := newWidget("layout-check", "gold", 1)
 	if err := c.Create(context.Background(), widget); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
-	expected := filepath.Join(root, "example.ctrlforge.dev", "v1", "Widget", "default", "layout-check.json")
+	expected := filepath.Join(root, "example.storectrl.dev", "v1", "Widget", "default", "layout-check.json")
 	if _, err := os.Stat(expected); err != nil {
 		t.Errorf("expected file at %s: %v", expected, err)
 	}
@@ -265,7 +265,7 @@ func TestWatch(t *testing.T) {
 
 	select {
 	case event := <-w.ResultChan():
-		if event.Type != ctrlforge.EventAdded {
+		if event.Type != storectrl.EventAdded {
 			t.Errorf("expected ADDED, got %s", event.Type)
 		}
 	case <-time.After(time.Second):
@@ -277,7 +277,7 @@ func TestAlreadyExists(t *testing.T) {
 	ctx := context.Background()
 	scheme := testScheme()
 	store := filesystem.NewStore(t.TempDir(), scheme)
-	c := ctrlforge.NewClient(store, scheme)
+	c := storectrl.NewClient(store, scheme)
 
 	widget := newWidget("dupe", "red", 1)
 	if err := c.Create(ctx, widget); err != nil {
@@ -295,7 +295,7 @@ func TestDeleteNotFound(t *testing.T) {
 	ctx := context.Background()
 	scheme := testScheme()
 	store := filesystem.NewStore(t.TempDir(), scheme)
-	c := ctrlforge.NewClient(store, scheme)
+	c := storectrl.NewClient(store, scheme)
 
 	widget := newWidget("ghost", "invisible", 0)
 	err := c.Delete(ctx, widget)
@@ -308,7 +308,7 @@ func TestListEmptyStore(t *testing.T) {
 	ctx := context.Background()
 	scheme := testScheme()
 	store := filesystem.NewStore(t.TempDir(), scheme)
-	c := ctrlforge.NewClient(store, scheme)
+	c := storectrl.NewClient(store, scheme)
 
 	list := &WidgetList{}
 	if err := c.List(ctx, list); err != nil {

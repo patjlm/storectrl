@@ -1,4 +1,4 @@
-package ctrlforge
+package storectrl
 
 import (
 	"context"
