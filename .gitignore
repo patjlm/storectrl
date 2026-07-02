@@ -1,0 +1,19 @@
+# Binary output
+/reconkit
+*.exe
+
+# Dependencies
+/vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local toolchain
+mise.toml
