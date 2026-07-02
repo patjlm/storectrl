@@ -1,4 +1,4 @@
-module reconkit
+module github.com/patjlm/ctrlforge
 
 go 1.26.0
 

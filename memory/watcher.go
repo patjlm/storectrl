@@ -5,13 +5,13 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	"reconkit"
+	"github.com/patjlm/ctrlforge"
 )
 
 type memoryWatcher struct {
 	store  *MemoryStore
 	gvk    schema.GroupVersionKind
-	ch     chan reconkit.Event
+	ch     chan ctrlforge.Event
 	mu     sync.Mutex
 	closed bool
 }
@@ -20,11 +20,11 @@ func newMemoryWatcher(store *MemoryStore, gvk schema.GroupVersionKind, bufSize i
 	return &memoryWatcher{
 		store: store,
 		gvk:   gvk,
-		ch:    make(chan reconkit.Event, bufSize),
+		ch:    make(chan ctrlforge.Event, bufSize),
 	}
 }
 
-func (w *memoryWatcher) ResultChan() <-chan reconkit.Event {
+func (w *memoryWatcher) ResultChan() <-chan ctrlforge.Event {
 	return w.ch
 }
 
@@ -48,7 +48,7 @@ func (w *memoryWatcher) isStopped() bool {
 // send delivers an event to the watcher. If the channel buffer is full,
 // the watcher is closed so the consumer can reconnect with WatchFromRevision
 // and replay missed events from the store's event log.
-func (w *memoryWatcher) send(event reconkit.Event) {
+func (w *memoryWatcher) send(event ctrlforge.Event) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 

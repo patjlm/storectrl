@@ -1,4 +1,4 @@
-package reconkit
+package ctrlforge
 
 import (
 	"context"
@@ -15,7 +15,7 @@ import (
 )
 
 // Kind creates a Source that watches objects of a specific kind using the provided cache.
-// It mirrors controller-runtime's source.Kind but works with the reconkit cache.
+// It mirrors controller-runtime's source.Kind but works with the ctrlforge cache.
 func Kind(cache cache.Cache, obj client.Object, handler handler.EventHandler, predicates ...predicate.Predicate) source.Source {
 	return &kindSource{
 		cache:      cache,

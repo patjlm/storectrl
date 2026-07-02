@@ -1,4 +1,4 @@
-package reconkit
+package ctrlforge
 
 import (
 	"fmt"
@@ -14,7 +14,7 @@ import (
 )
 
 // Builder provides a fluent interface for constructing controllers.
-// It wraps controller-runtime's builder with reconkit-specific defaults.
+// It wraps controller-runtime's builder with ctrlforge-specific defaults.
 type Builder struct {
 	mgr         manager.Manager
 	forInput    ForInput
@@ -51,7 +51,7 @@ type OwnsOption = builder.OwnsOption
 
 // NewControllerManagedBy returns a new controller builder.
 // The builder provides a fluent interface similar to controller-runtime's
-// builder, but works with reconkit's store-backed manager.
+// builder, but works with ctrlforge's store-backed manager.
 func NewControllerManagedBy(mgr manager.Manager) *Builder {
 	return &Builder{
 		mgr:        mgr,

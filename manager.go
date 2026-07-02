@@ -1,4 +1,4 @@
-package reconkit
+package ctrlforge
 
 import (
 	"context"
@@ -22,7 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/conversion"
 )
 
-// ManagerOptions configure the reconkit manager.
+// ManagerOptions configure the ctrlforge manager.
 type ManagerOptions struct {
 	// Scheme is required - defines the API types known to the manager.
 	Scheme *runtime.Scheme
@@ -36,7 +36,7 @@ type ManagerOptions struct {
 	HealthProbeBindAddress string
 }
 
-// NewManager creates a manager.Manager backed by a reconkit Store.
+// NewManager creates a manager.Manager backed by a ctrlforge Store.
 // The manager provides the same interface as controller-runtime's manager
 // so existing controller patterns work with non-Kubernetes backends.
 func NewManager(store Store, opts ManagerOptions) (manager.Manager, error) {
@@ -176,7 +176,7 @@ func (m *storeManager) AddReadyzCheck(name string, check healthz.Checker) error 
 }
 
 func (m *storeManager) GetWebhookServer() webhook.Server {
-	panic("webhooks not supported in reconkit - use manager backed by real Kubernetes API server")
+	panic("webhooks not supported in ctrlforge - use manager backed by real Kubernetes API server")
 }
 
 func (m *storeManager) GetLogger() logr.Logger {
@@ -197,7 +197,7 @@ func (m *storeManager) Start(ctx context.Context) error {
 }
 
 func (m *storeManager) start(ctx context.Context) error {
-	m.logger.Info("starting reconkit manager")
+	m.logger.Info("starting ctrlforge manager")
 
 	// Start health probe server if configured
 	if m.healthProbeBindAddress != "" {

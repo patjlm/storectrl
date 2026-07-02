@@ -5,13 +5,13 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	"reconkit"
+	"github.com/patjlm/ctrlforge"
 )
 
 type fileWatcher struct {
 	store  *FileStore
 	gvk    schema.GroupVersionKind
-	ch     chan reconkit.Event
+	ch     chan ctrlforge.Event
 	mu     sync.Mutex
 	closed bool
 }
@@ -20,11 +20,11 @@ func newFileWatcher(store *FileStore, gvk schema.GroupVersionKind, bufSize int) 
 	return &fileWatcher{
 		store: store,
 		gvk:   gvk,
-		ch:    make(chan reconkit.Event, bufSize),
+		ch:    make(chan ctrlforge.Event, bufSize),
 	}
 }
 
-func (w *fileWatcher) ResultChan() <-chan reconkit.Event {
+func (w *fileWatcher) ResultChan() <-chan ctrlforge.Event {
 	return w.ch
 }
 
@@ -45,7 +45,7 @@ func (w *fileWatcher) isStopped() bool {
 	return w.closed
 }
 
-func (w *fileWatcher) send(event reconkit.Event) {
+func (w *fileWatcher) send(event ctrlforge.Event) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 

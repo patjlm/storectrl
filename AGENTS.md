@@ -1,15 +1,15 @@
-# reconkit — Agent Guide
+# ctrlforge — Agent Guide
 
 Instructions for AI agents working on this codebase.
 
 ## What this is
 
-reconkit is a Go library that reimplements controller-runtime's core interfaces (`client.Client`, `cache.Cache`, `manager.Manager`) with a pluggable `Store` backend instead of the Kubernetes API server. It lets developers write controllers using the standard reconciler pattern against any datastore.
+ctrlforge is a Go library that reimplements controller-runtime's core interfaces (`client.Client`, `cache.Cache`, `manager.Manager`) with a pluggable `Store` backend instead of the Kubernetes API server. It lets developers write controllers using the standard reconciler pattern against any datastore.
 
 ## Module layout
 
 ```
-reconkit/                 # Main package — all public API
+ctrlforge/                 # Main package — all public API
 ├── store.go              # Store interface, WatchFromRevision option
 ├── watcher.go            # Watcher, Event, EventType (incl. EventBookmark)
 ├── errors.go             # NotFoundError, AlreadyExistsError, ConflictError, RevisionTooOldError
@@ -64,7 +64,7 @@ Convenience embeds. `BaseObject` = `metav1.TypeMeta` + `metav1.ObjectMeta`. Type
 
 4. **Cache is watch-backed.** `storeCache` calls `Store.List` for initial sync, then `Store.Watch` for incremental updates. Reads go to the in-memory cache, not the store. Field indexers work the same as controller-runtime.
 
-5. **Manager stubs K8s-specific features.** Webhooks panic, leader election is always-elected, RESTMapper is empty, EventRecorder logs only. This is intentional — reconkit targets non-K8s backends.
+5. **Manager stubs K8s-specific features.** Webhooks panic, leader election is always-elected, RESTMapper is empty, EventRecorder logs only. This is intentional — ctrlforge targets non-K8s backends.
 
 ## Working with this code
 
@@ -84,8 +84,8 @@ Do not run `go test`, `go vet`, or `gofmt` directly — the Makefile targets inc
 
 ### Adding a new Store backend
 
-1. Create a new package (e.g., `reconkit/sql`)
-2. Implement `reconkit.Store` — see `memory/store.go` as reference
+1. Create a new package (e.g., `ctrlforge/sql`)
+2. Implement `ctrlforge.Store` — see `memory/store.go` as reference
 3. Pay attention to:
    - Thread safety (Store must be safe for concurrent use)
    - Setting `UID` and `ResourceVersion` on Create (use a global monotonic revision counter, not per-object)

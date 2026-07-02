@@ -1,42 +1,42 @@
-# Migrating to reconkit
+# Migrating to ctrlforge
 
 ## Overview
 
-reconkit is a Go library that brings the controller-runtime reconciliation pattern to any backend datastore, not just the Kubernetes API server. It implements controller-runtime's `client.Client`, `cache.Cache`, and `manager.Manager` interfaces backed by a pluggable `Store` interface.
+ctrlforge is a Go library that brings the controller-runtime reconciliation pattern to any backend datastore, not just the Kubernetes API server. It implements controller-runtime's `client.Client`, `cache.Cache`, and `manager.Manager` interfaces backed by a pluggable `Store` interface.
 
 This means you can write reconcilers using familiar controller-runtime patterns while persisting state to SQL databases, cloud APIs (GCP, AWS, Azure), or any other backend — not just Kubernetes. Your reconciler code stays largely unchanged; only the infrastructure setup differs.
 
-### When to Use reconkit
+### When to Use ctrlforge
 
-Use reconkit when:
+Use ctrlforge when:
 - You want to build controllers that reconcile against non-Kubernetes backends (SQL, GCP APIs, etc.)
 - You need the reconciliation pattern but don't have a Kubernetes API server
 - You want to reuse existing controller-runtime knowledge and patterns
 - You're building control planes or operators for custom resources stored outside of Kubernetes
 
-Don't use reconkit if:
+Don't use ctrlforge if:
 - You're working with actual Kubernetes resources in a real cluster (use controller-runtime directly)
 - You need admission webhooks or other Kubernetes-specific features
 
 ## Making Your Types Compatible
 
-For your domain types to work with reconkit, they must implement the `client.Object` interface from controller-runtime. reconkit provides helpers to make this simple.
+For your domain types to work with ctrlforge, they must implement the `client.Object` interface from controller-runtime. ctrlforge provides helpers to make this simple.
 
-### Option A: Embed reconkit.BaseObject (Recommended)
+### Option A: Embed ctrlforge.BaseObject (Recommended)
 
-The simplest approach is to embed `reconkit.BaseObject` in your types:
+The simplest approach is to embed `ctrlforge.BaseObject` in your types:
 
 ```go
 package myapp
 
 import (
     "k8s.io/apimachinery/pkg/runtime"
-    "reconkit"
+    "ctrlforge"
 )
 
 // Widget is your custom domain type
 type Widget struct {
-    reconkit.BaseObject `json:",inline"`
+    ctrlforge.BaseObject `json:",inline"`
     
     Spec   WidgetSpec   `json:"spec"`
     Status WidgetStatus `json:"status"`
@@ -98,11 +98,11 @@ func (w *Widget) DeepCopyObject() runtime.Object {
 
 ### List Types
 
-Every object type needs a corresponding list type. Embed `reconkit.BaseList`:
+Every object type needs a corresponding list type. Embed `ctrlforge.BaseList`:
 
 ```go
 type WidgetList struct {
-    reconkit.BaseList `json:",inline"`
+    ctrlforge.BaseList `json:",inline"`
     Items             []Widget `json:"items"`
 }
 
@@ -196,15 +196,15 @@ func main() {
 }
 ```
 
-### After: reconkit + Custom Backend
+### After: ctrlforge + Custom Backend
 
 ```go
 package main
 
 import (
     "context"
-    "reconkit"
-    "reconkit/memory"
+    "ctrlforge"
+    "ctrlforge/memory"
 )
 
 func main() {
@@ -213,7 +213,7 @@ func main() {
     // Setup with custom store backend
     store := memory.NewStore(scheme)  // or sqlstore.New(db), gcpstore.New(...)
     
-    mgr, err := reconkit.NewManager(store, reconkit.ManagerOptions{
+    mgr, err := ctrlforge.NewManager(store, ctrlforge.ManagerOptions{
         Scheme: scheme,
     })
     if err != nil {
@@ -221,7 +221,7 @@ func main() {
     }
     
     // Create controller (identical to before!)
-    if err := reconkit.NewControllerManagedBy(mgr).
+    if err := ctrlforge.NewControllerManagedBy(mgr).
         For(&Widget{}).
         Complete(&WidgetReconciler{
             Client: mgr.GetClient(),
@@ -236,7 +236,7 @@ func main() {
 }
 ```
 
-The only difference: swap `ctrl.NewManager(restConfig, ...)` for `reconkit.NewManager(store, ...)`.
+The only difference: swap `ctrl.NewManager(restConfig, ...)` for `ctrlforge.NewManager(store, ...)`.
 
 ## Reconciler Changes
 
@@ -319,7 +319,7 @@ All the standard error checks work:
 
 ## Writing a Custom Store Backend
 
-To connect reconkit to your backend (SQL, cloud APIs, etc.), implement the `Store` interface:
+To connect ctrlforge to your backend (SQL, cloud APIs, etc.), implement the `Store` interface:
 
 ```go
 type Store interface {
@@ -345,7 +345,7 @@ import (
     
     "k8s.io/apimachinery/pkg/runtime"
     "sigs.k8s.io/controller-runtime/pkg/client"
-    "reconkit"
+    "ctrlforge"
 )
 
 type SQLStore struct {
@@ -370,7 +370,7 @@ func (s *SQLStore) Get(ctx context.Context, key client.ObjectKey, obj client.Obj
     query := `SELECT data FROM objects WHERE gvk = ? AND namespace = ? AND name = ?`
     err := s.db.QueryRowContext(ctx, query, gvkString(gvk), key.Namespace, key.Name).Scan(&data)
     if err == sql.ErrNoRows {
-        return &reconkit.NotFoundError{Key: key.String()}
+        return &ctrlforge.NotFoundError{Key: key.String()}
     }
     if err != nil {
         return err
@@ -395,11 +395,11 @@ func (s *SQLStore) Create(ctx context.Context, obj client.Object) error {
     query := `INSERT INTO objects (gvk, namespace, name, data, resource_version) VALUES (?, ?, ?, ?, ?)`
     _, err = s.db.ExecContext(ctx, query, gvkString(gvk), key.Namespace, key.Name, data, "1")
     if isDuplicateKeyError(err) {
-        return &reconkit.AlreadyExistsError{Key: key.String()}
+        return &ctrlforge.AlreadyExistsError{Key: key.String()}
     }
     
     // Notify watchers
-    s.watchers.Notify(gvk, reconkit.Event{Type: reconkit.EventAdded, Object: obj})
+    s.watchers.Notify(gvk, ctrlforge.Event{Type: ctrlforge.EventAdded, Object: obj})
     return err
 }
 
@@ -427,11 +427,11 @@ func (s *SQLStore) Update(ctx context.Context, obj client.Object) error {
     
     rows, _ := result.RowsAffected()
     if rows == 0 {
-        return &reconkit.ConflictError{Key: key.String()}
+        return &ctrlforge.ConflictError{Key: key.String()}
     }
     
     // Notify watchers
-    s.watchers.Notify(gvk, reconkit.Event{Type: reconkit.EventModified, Object: obj})
+    s.watchers.Notify(gvk, ctrlforge.Event{Type: ctrlforge.EventModified, Object: obj})
     return nil
 }
 
@@ -440,7 +440,7 @@ func (s *SQLStore) Delete(ctx context.Context, obj client.Object) error {
     return nil
 }
 
-func (s *SQLStore) Watch(ctx context.Context, list client.ObjectList, opts ...client.ListOption) (reconkit.Watcher, error) {
+func (s *SQLStore) Watch(ctx context.Context, list client.ObjectList, opts ...client.ListOption) (ctrlforge.Watcher, error) {
     gvk, _ := s.gvkForList(list)
     return s.watchers.NewWatcher(ctx, gvk, opts...)
 }
@@ -466,7 +466,7 @@ func (s *SQLStore) Watch(ctx context.Context, list client.ObjectList, opts ...cl
 
 ## Limitations
 
-reconkit provides core controller-runtime functionality but has several limitations:
+ctrlforge provides core controller-runtime functionality but has several limitations:
 
 ### Not Supported
 
@@ -494,7 +494,7 @@ reconkit provides core controller-runtime functionality but has several limitati
 
 ### Performance Considerations
 
-- **Caching**: reconkit uses an in-memory cache just like controller-runtime. Ensure your Store's Watch implementation is efficient to keep the cache synchronized.
+- **Caching**: ctrlforge uses an in-memory cache just like controller-runtime. Ensure your Store's Watch implementation is efficient to keep the cache synchronized.
 
 - **ResourceVersion**: ResourceVersion is a string to match Kubernetes semantics, but backends can use integers (as strings) for simpler increment logic.
 
@@ -502,10 +502,10 @@ reconkit provides core controller-runtime functionality but has several limitati
 
 ## Next Steps
 
-1. **Define your domain types** using `reconkit.BaseObject` and `reconkit.BaseList`
+1. **Define your domain types** using `ctrlforge.BaseObject` and `ctrlforge.BaseList`
 2. **Create a scheme** and register your types
 3. **Choose a backend**: start with `memory.NewStore(scheme)` for testing, then implement a Store for your production backend (SQL, GCP, etc.)
 4. **Write reconcilers** using standard controller-runtime patterns
-5. **Wire it up** with `reconkit.NewManager(store, opts)`
+5. **Wire it up** with `ctrlforge.NewManager(store, opts)`
 
 For a complete working example, see [example_test.go](../example_test.go).

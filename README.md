@@ -1,4 +1,4 @@
-# reconkit
+# ctrlforge
 
 A Go library that provides the [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime) reconciler pattern with pluggable backends. Write controllers using the same `client.Client`, `cache.Cache`, and `manager.Manager` interfaces you already know — but store and watch data from any backend, not just the Kubernetes API server.
 
@@ -27,7 +27,7 @@ func (r *MyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 
 ### 1. Define your types
 
-Embed `reconkit.BaseObject` (which provides `TypeMeta` + `ObjectMeta`) and implement `DeepCopyObject`:
+Embed `ctrlforge.BaseObject` (which provides `TypeMeta` + `ObjectMeta`) and implement `DeepCopyObject`:
 
 ```go
 package mycontroller
@@ -36,13 +36,13 @@ import (
     "k8s.io/apimachinery/pkg/runtime"
     "k8s.io/apimachinery/pkg/runtime/schema"
     metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-    "reconkit"
+    "ctrlforge"
 )
 
 var GroupVersion = schema.GroupVersion{Group: "myapp.example.com", Version: "v1"}
 
 type Cluster struct {
-    reconkit.BaseObject `json:",inline"`
+    ctrlforge.BaseObject `json:",inline"`
     Spec                ClusterSpec   `json:"spec"`
     Status              ClusterStatus `json:"status"`
 }
@@ -66,7 +66,7 @@ func (c *Cluster) DeepCopyObject() runtime.Object {
 }
 
 type ClusterList struct {
-    reconkit.BaseList `json:",inline"`
+    ctrlforge.BaseList `json:",inline"`
     Items             []Cluster `json:"items"`
 }
 
@@ -94,7 +94,7 @@ func NewScheme() *runtime.Scheme {
 
 ### 3. Write the reconciler
 
-Standard controller-runtime reconciler — no reconkit-specific code:
+Standard controller-runtime reconciler — no ctrlforge-specific code:
 
 ```go
 type ClusterReconciler struct {
@@ -131,8 +131,8 @@ import (
     "context"
     "log"
 
-    "reconkit"
-    "reconkit/memory"
+    "ctrlforge"
+    "ctrlforge/memory"
 )
 
 func main() {
@@ -141,7 +141,7 @@ func main() {
     // Pick a backend — memory, SQL, GCP, etc.
     store := memory.NewStore(scheme)
 
-    mgr, err := reconkit.NewManager(store, reconkit.ManagerOptions{
+    mgr, err := ctrlforge.NewManager(store, ctrlforge.ManagerOptions{
         Scheme: scheme,
     })
     if err != nil {
@@ -149,7 +149,7 @@ func main() {
     }
 
     // Register the controller — same pattern as controller-runtime
-    reconkit.NewControllerManagedBy(mgr).
+    ctrlforge.NewControllerManagedBy(mgr).
         For(&Cluster{}).
         Complete(&ClusterReconciler{Client: mgr.GetClient()})
 
@@ -165,10 +165,10 @@ func main() {
 ```go
 // Only these two lines change:
 // Before:  mgr, _ := ctrl.NewManager(restConfig, ctrl.Options{Scheme: scheme})
-// After:   mgr, _ := reconkit.NewManager(store, reconkit.ManagerOptions{Scheme: scheme})
+// After:   mgr, _ := ctrlforge.NewManager(store, ctrlforge.ManagerOptions{Scheme: scheme})
 //
 // Before:  ctrl.NewControllerManagedBy(mgr)
-// After:   reconkit.NewControllerManagedBy(mgr)
+// After:   ctrlforge.NewControllerManagedBy(mgr)
 ```
 
 ## Implementing a custom Store
@@ -187,7 +187,7 @@ type Store interface {
 }
 ```
 
-**Error contract:** Return `*reconkit.NotFoundError`, `*reconkit.AlreadyExistsError`, or `*reconkit.ConflictError` — they implement the `APIStatus` interface so `apierrors.IsNotFound()` etc. work transparently.
+**Error contract:** Return `*ctrlforge.NotFoundError`, `*ctrlforge.AlreadyExistsError`, or `*ctrlforge.ConflictError` — they implement the `APIStatus` interface so `apierrors.IsNotFound()` etc. work transparently.
 
 **Optimistic concurrency:** Check `ResourceVersion` on Update and return `ConflictError` on mismatch. Set `UID` and `ResourceVersion` on Create.
 
@@ -204,7 +204,7 @@ See `memory/store.go` for a complete reference implementation.
 └───────────────────────┬──────────────────────────┘
                         │ client.Client interface
 ┌───────────────────────┴──────────────────────────┐
-│              reconkit.Manager                     │
+│              ctrlforge.Manager                     │
 │  ┌─────────────┐  ┌──────────┐  ┌─────────────┐ │
 │  │ storeClient │  │storeCache│  │  Builder /   │ │
 │  │(client.Client│  │(cache.   │  │ Controller  │ │
@@ -213,7 +213,7 @@ See `memory/store.go` for a complete reference implementation.
 └─────────┼──────────────┼─────────────────────────┘
           │              │
           └──────┬───────┘
-                 │ reconkit.Store interface
+                 │ ctrlforge.Store interface
     ┌────────────┴────────────────┐
     │    Backend Implementation    │
     │  memory │ SQL │ GCP │ ...   │
@@ -224,7 +224,7 @@ See `memory/store.go` for a complete reference implementation.
 
 | Backend | Package | Status |
 |---------|---------|--------|
-| In-memory | `reconkit/memory` | Ready — maps + channels, thread-safe, optimistic concurrency |
+| In-memory | `ctrlforge/memory` | Ready — maps + channels, thread-safe, optimistic concurrency |
 
 ## Limitations
 

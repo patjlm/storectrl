@@ -1,4 +1,4 @@
-package reconkit_test
+package ctrlforge_test
 
 import (
 	"context"
@@ -15,14 +15,14 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"reconkit"
-	"reconkit/memory"
+	"github.com/patjlm/ctrlforge"
+	"github.com/patjlm/ctrlforge/memory"
 )
 
 type Widget struct {
-	reconkit.BaseObject `json:",inline"`
-	Spec                WidgetSpec   `json:"spec"`
-	Status              WidgetStatus `json:"status"`
+	ctrlforge.BaseObject `json:",inline"`
+	Spec                 WidgetSpec   `json:"spec"`
+	Status               WidgetStatus `json:"status"`
 }
 
 type WidgetSpec struct {
@@ -47,8 +47,8 @@ func (w *Widget) DeepCopyObject() runtime.Object {
 }
 
 type WidgetList struct {
-	reconkit.BaseList `json:",inline"`
-	Items             []Widget `json:"items"`
+	ctrlforge.BaseList `json:",inline"`
+	Items              []Widget `json:"items"`
 }
 
 func (w *WidgetList) DeepCopyObject() runtime.Object {
@@ -67,7 +67,7 @@ func (w *WidgetList) DeepCopyObject() runtime.Object {
 }
 
 type Gadget struct {
-	reconkit.BaseObject `json:",inline"`
+	ctrlforge.BaseObject `json:",inline"`
 }
 
 func (g *Gadget) DeepCopyObject() runtime.Object {
@@ -80,8 +80,8 @@ func (g *Gadget) DeepCopyObject() runtime.Object {
 }
 
 type GadgetList struct {
-	reconkit.BaseList `json:",inline"`
-	Items             []Gadget `json:"items"`
+	ctrlforge.BaseList `json:",inline"`
+	Items              []Gadget `json:"items"`
 }
 
 func (g *GadgetList) DeepCopyObject() runtime.Object {
@@ -99,8 +99,8 @@ func (g *GadgetList) DeepCopyObject() runtime.Object {
 	return out
 }
 
-var gadgetGV = schema.GroupVersion{Group: "gadget.reconkit.dev", Version: "v1"}
-var widgetGV = schema.GroupVersion{Group: "example.reconkit.dev", Version: "v1"}
+var gadgetGV = schema.GroupVersion{Group: "gadget.ctrlforge.dev", Version: "v1"}
+var widgetGV = schema.GroupVersion{Group: "example.ctrlforge.dev", Version: "v1"}
 
 func testScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
@@ -124,7 +124,7 @@ func TestWidgetCRUD(t *testing.T) {
 	ctx := context.Background()
 	scheme := testScheme()
 	store := memory.NewStore(scheme)
-	c := reconkit.NewClient(store, scheme)
+	c := ctrlforge.NewClient(store, scheme)
 
 	widget := newWidget("my-widget", "blue", 42)
 
@@ -197,7 +197,7 @@ func TestOptimisticConcurrency(t *testing.T) {
 	ctx := context.Background()
 	scheme := testScheme()
 	store := memory.NewStore(scheme)
-	c := reconkit.NewClient(store, scheme)
+	c := ctrlforge.NewClient(store, scheme)
 
 	widget := newWidget("concurrent-widget", "blue", 10)
 	if err := c.Create(ctx, widget); err != nil {
@@ -278,7 +278,7 @@ func TestWidgetReconciler(t *testing.T) {
 	ctx := context.Background()
 	scheme := testScheme()
 	store := memory.NewStore(scheme)
-	c := reconkit.NewClient(store, scheme)
+	c := ctrlforge.NewClient(store, scheme)
 
 	widget := newWidget("test-widget", "blue", 42)
 	if err := c.Create(ctx, widget); err != nil {
@@ -324,7 +324,7 @@ func TestWatchResume(t *testing.T) {
 	}
 
 	// Watch from revision 0 — should replay both creates
-	watcher, err := store.Watch(ctx, &WidgetList{}, reconkit.WatchFromRevision(0))
+	watcher, err := store.Watch(ctx, &WidgetList{}, ctrlforge.WatchFromRevision(0))
 	if err != nil {
 		t.Fatalf("watch from 0: %v", err)
 	}
@@ -332,7 +332,7 @@ func TestWatchResume(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		select {
 		case evt := <-watcher.ResultChan():
-			if evt.Type != reconkit.EventAdded {
+			if evt.Type != ctrlforge.EventAdded {
 				t.Errorf("replay %d: expected ADDED, got %s", i, evt.Type)
 			}
 		case <-time.After(time.Second):
@@ -348,7 +348,7 @@ func TestWatchResume(t *testing.T) {
 
 	select {
 	case evt := <-watcher.ResultChan():
-		if evt.Type != reconkit.EventAdded || evt.Object.GetName() != "w3" {
+		if evt.Type != ctrlforge.EventAdded || evt.Object.GetName() != "w3" {
 			t.Errorf("expected ADDED w3, got %s %s", evt.Type, evt.Object.GetName())
 		}
 	case <-time.After(time.Second):
@@ -357,14 +357,14 @@ func TestWatchResume(t *testing.T) {
 	watcher.Stop()
 
 	// Resume from revision 2 (after w2 create) — should replay only w3
-	watcher2, err := store.Watch(ctx, &WidgetList{}, reconkit.WatchFromRevision(2))
+	watcher2, err := store.Watch(ctx, &WidgetList{}, ctrlforge.WatchFromRevision(2))
 	if err != nil {
 		t.Fatalf("watch from 2: %v", err)
 	}
 
 	select {
 	case evt := <-watcher2.ResultChan():
-		if evt.Type != reconkit.EventAdded || evt.Object.GetName() != "w3" {
+		if evt.Type != ctrlforge.EventAdded || evt.Object.GetName() != "w3" {
 			t.Errorf("expected ADDED w3, got %s %s", evt.Type, evt.Object.GetName())
 		}
 	case <-time.After(time.Second):
@@ -385,7 +385,7 @@ func TestWatchResumeNoGap(t *testing.T) {
 	}
 
 	// Resume watch from revision 1 (w1's create)
-	watcher, err := store.Watch(ctx, &WidgetList{}, reconkit.WatchFromRevision(1))
+	watcher, err := store.Watch(ctx, &WidgetList{}, ctrlforge.WatchFromRevision(1))
 	if err != nil {
 		t.Fatalf("watch from 1: %v", err)
 	}
@@ -421,8 +421,8 @@ func TestWatchRevisionTooOld(t *testing.T) {
 	}
 
 	// Revision 1 is gone (log has revisions 6-10)
-	_, err := store.Watch(ctx, &WidgetList{}, reconkit.WatchFromRevision(1))
-	var rvErr *reconkit.RevisionTooOldError
+	_, err := store.Watch(ctx, &WidgetList{}, ctrlforge.WatchFromRevision(1))
+	var rvErr *ctrlforge.RevisionTooOldError
 	if !stderrors.As(err, &rvErr) {
 		t.Fatalf("expected RevisionTooOldError, got %v", err)
 	}
@@ -434,7 +434,7 @@ func TestWatchRevisionTooOld(t *testing.T) {
 	}
 
 	// Revision 5 should still work (oldest in log is 6, and 5+1 >= 6)
-	watcher, err := store.Watch(ctx, &WidgetList{}, reconkit.WatchFromRevision(5))
+	watcher, err := store.Watch(ctx, &WidgetList{}, ctrlforge.WatchFromRevision(5))
 	if err != nil {
 		t.Fatalf("watch from 5 should work: %v", err)
 	}
@@ -442,7 +442,7 @@ func TestWatchRevisionTooOld(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		select {
 		case evt := <-watcher.ResultChan():
-			if evt.Type != reconkit.EventAdded {
+			if evt.Type != ctrlforge.EventAdded {
 				t.Errorf("event %d: expected ADDED, got %s", i, evt.Type)
 			}
 		case <-time.After(time.Second):
@@ -485,7 +485,7 @@ func TestWatchOverflowClosesWatch(t *testing.T) {
 	}
 
 	// Can resume from last seen revision using event log
-	watcher2, err := store.Watch(ctx, &WidgetList{}, reconkit.WatchFromRevision(int64(count)))
+	watcher2, err := store.Watch(ctx, &WidgetList{}, ctrlforge.WatchFromRevision(int64(count)))
 	if err != nil {
 		t.Fatalf("resume after overflow: %v", err)
 	}
@@ -510,12 +510,12 @@ func TestWatchResumeWithMixedEventTypes(t *testing.T) {
 	}
 
 	// Replay all 3 events
-	watcher, err := store.Watch(ctx, &WidgetList{}, reconkit.WatchFromRevision(0))
+	watcher, err := store.Watch(ctx, &WidgetList{}, ctrlforge.WatchFromRevision(0))
 	if err != nil {
 		t.Fatalf("watch: %v", err)
 	}
 
-	expected := []reconkit.EventType{reconkit.EventAdded, reconkit.EventModified, reconkit.EventDeleted}
+	expected := []ctrlforge.EventType{ctrlforge.EventAdded, ctrlforge.EventModified, ctrlforge.EventDeleted}
 	for i, want := range expected {
 		select {
 		case evt := <-watcher.ResultChan():
@@ -545,14 +545,14 @@ func TestWatchResumeFiltersGVK(t *testing.T) {
 	g := &Gadget{}
 	g.Name = "g1"
 	g.Namespace = "default"
-	g.APIVersion = "gadget.reconkit.dev/v1"
+	g.APIVersion = "gadget.ctrlforge.dev/v1"
 	g.Kind = "Gadget"
 	if err := store.Create(ctx, g); err != nil {
 		t.Fatalf("create gadget: %v", err)
 	}
 
 	// Watch Widgets from revision 0 — should only see Widget, not Gadget
-	watcher, err := store.Watch(ctx, &WidgetList{}, reconkit.WatchFromRevision(0))
+	watcher, err := store.Watch(ctx, &WidgetList{}, ctrlforge.WatchFromRevision(0))
 	if err != nil {
 		t.Fatalf("watch: %v", err)
 	}

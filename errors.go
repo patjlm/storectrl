@@ -1,4 +1,4 @@
-package reconkit
+package ctrlforge
 
 import (
 	"fmt"
@@ -8,7 +8,7 @@ import (
 
 // Error types implement the APIStatus interface so that
 // apierrors.IsNotFound(), apierrors.IsAlreadyExists(), and
-// apierrors.IsConflict() work transparently with reconkit errors.
+// apierrors.IsConflict() work transparently with ctrlforge errors.
 // This lets existing controller code keep using the standard error
 // checks without modification.
 
