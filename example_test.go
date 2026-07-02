@@ -604,3 +604,210 @@ func TestListResourceVersion(t *testing.T) {
 		t.Errorf("expected RV=1, got %s", list.GetResourceVersion())
 	}
 }
+
+func TestCacheGetAndList(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	scheme := testScheme()
+	store := memory.NewStore(scheme)
+	c := ctrlforge.NewCache(store, scheme)
+
+	if _, err := c.GetInformer(ctx, &Widget{}); err != nil {
+		t.Fatalf("get informer: %v", err)
+	}
+
+	go func() { _ = c.Start(ctx) }()
+	if !c.WaitForCacheSync(ctx) {
+		t.Fatal("cache never synced")
+	}
+
+	w1 := newWidget("w1", "blue", 10)
+	w2 := newWidget("w2", "red", 20)
+	if err := store.Create(ctx, w1); err != nil {
+		t.Fatalf("create w1: %v", err)
+	}
+	if err := store.Create(ctx, w2); err != nil {
+		t.Fatalf("create w2: %v", err)
+	}
+
+	// Poll until cache sees both objects
+	deadline := time.Now().Add(2 * time.Second)
+	var list *WidgetList
+	for time.Now().Before(deadline) {
+		list = &WidgetList{}
+		if err := c.List(ctx, list); err == nil && len(list.Items) == 2 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if len(list.Items) != 2 {
+		t.Fatalf("expected 2 widgets in cache, got %d", len(list.Items))
+	}
+
+	got := &Widget{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "w1"}, got); err != nil {
+		t.Fatalf("get w1: %v", err)
+	}
+	if got.Spec.Color != "blue" || got.Spec.Size != 10 {
+		t.Errorf("wrong w1 spec: color=%s size=%d", got.Spec.Color, got.Spec.Size)
+	}
+
+	got = &Widget{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "w2"}, got); err != nil {
+		t.Fatalf("get w2: %v", err)
+	}
+	if got.Spec.Color != "red" || got.Spec.Size != 20 {
+		t.Errorf("wrong w2 spec: color=%s size=%d", got.Spec.Color, got.Spec.Size)
+	}
+}
+
+func TestCacheWatchUpdates(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	scheme := testScheme()
+	store := memory.NewStore(scheme)
+	c := ctrlforge.NewCache(store, scheme)
+
+	if _, err := c.GetInformer(ctx, &Widget{}); err != nil {
+		t.Fatalf("get informer: %v", err)
+	}
+
+	go func() { _ = c.Start(ctx) }()
+	if !c.WaitForCacheSync(ctx) {
+		t.Fatal("cache never synced")
+	}
+
+	w := newWidget("w1", "blue", 10)
+	if err := store.Create(ctx, w); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Poll until cache sees the object
+	deadline := time.Now().Add(2 * time.Second)
+	got := &Widget{}
+	for time.Now().Before(deadline) {
+		got = &Widget{}
+		if err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "w1"}, got); err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got.Spec.Color != "blue" {
+		t.Fatal("cache never saw created widget")
+	}
+
+	w.Spec.Color = "red"
+	w.Spec.Size = 99
+	if err := store.Update(ctx, w); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	// Poll until cache reflects the update
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		got = &Widget{}
+		if err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "w1"}, got); err == nil && got.Spec.Color == "red" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got.Spec.Color != "red" || got.Spec.Size != 99 {
+		t.Fatalf("cache did not reflect update: color=%s size=%d", got.Spec.Color, got.Spec.Size)
+	}
+
+	if err := store.Delete(ctx, w); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	// Poll until cache reflects the deletion
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if errors.IsNotFound(c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "w1"}, &Widget{})) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !errors.IsNotFound(c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "w1"}, &Widget{})) {
+		t.Error("cache did not reflect deletion")
+	}
+}
+
+func TestCacheFieldIndex(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	scheme := testScheme()
+	store := memory.NewStore(scheme)
+	c := ctrlforge.NewCache(store, scheme)
+
+	if _, err := c.GetInformer(ctx, &Widget{}); err != nil {
+		t.Fatalf("get informer: %v", err)
+	}
+
+	if err := c.IndexField(ctx, &Widget{}, ".spec.color", func(obj client.Object) []string {
+		return []string{obj.(*Widget).Spec.Color}
+	}); err != nil {
+		t.Fatalf("index field: %v", err)
+	}
+
+	go func() { _ = c.Start(ctx) }()
+	if !c.WaitForCacheSync(ctx) {
+		t.Fatal("cache never synced")
+	}
+
+	for _, w := range []*Widget{
+		newWidget("w-blue-1", "blue", 1),
+		newWidget("w-blue-2", "blue", 2),
+		newWidget("w-red-1", "red", 3),
+		newWidget("w-green-1", "green", 4),
+	} {
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create %s: %v", w.Name, err)
+		}
+	}
+
+	// Poll until all 4 widgets appear in the cache
+	deadline := time.Now().Add(2 * time.Second)
+	var all *WidgetList
+	for time.Now().Before(deadline) {
+		all = &WidgetList{}
+		if err := c.List(ctx, all); err == nil && len(all.Items) == 4 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if len(all.Items) != 4 {
+		t.Fatalf("expected 4 widgets, got %d", len(all.Items))
+	}
+
+	blues := &WidgetList{}
+	if err := c.List(ctx, blues, client.MatchingFields{".spec.color": "blue"}); err != nil {
+		t.Fatalf("list by color blue: %v", err)
+	}
+	if len(blues.Items) != 2 {
+		t.Errorf("expected 2 blue widgets, got %d", len(blues.Items))
+	}
+	for _, w := range blues.Items {
+		if w.Spec.Color != "blue" {
+			t.Errorf("expected blue, got %s", w.Spec.Color)
+		}
+	}
+
+	reds := &WidgetList{}
+	if err := c.List(ctx, reds, client.MatchingFields{".spec.color": "red"}); err != nil {
+		t.Fatalf("list by color red: %v", err)
+	}
+	if len(reds.Items) != 1 {
+		t.Errorf("expected 1 red widget, got %d", len(reds.Items))
+	}
+
+	purples := &WidgetList{}
+	if err := c.List(ctx, purples, client.MatchingFields{".spec.color": "purple"}); err != nil {
+		t.Fatalf("list by color purple: %v", err)
+	}
+	if len(purples.Items) != 0 {
+		t.Errorf("expected 0 purple widgets, got %d", len(purples.Items))
+	}
+}

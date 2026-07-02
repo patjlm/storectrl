@@ -4,7 +4,7 @@ Instructions for AI agents working on this codebase.
 
 ## What this is
 
-ctrlforge is a Go library that reimplements controller-runtime's core interfaces (`client.Client`, `cache.Cache`, `manager.Manager`) with a pluggable `Store` backend instead of the Kubernetes API server. It lets developers write controllers using the standard reconciler pattern against any datastore.
+ctrlforge is a Go component library that provides `client.Client` and `cache.Cache` implementations backed by a pluggable `Store` interface instead of the Kubernetes API server. It lets developers write controllers using the standard reconciler pattern against any datastore, wired into controller-runtime's standard `manager.Manager` via factory overrides.
 
 ## Module layout
 
@@ -16,9 +16,6 @@ ctrlforge/                 # Main package — all public API
 ├── object.go             # BaseObject, BaseList (embed for client.Object compat)
 ├── client.go             # client.Client implementation wrapping Store
 ├── cache.go              # cache.Cache implementation (watch-backed in-memory cache)
-├── source.go             # source.Source implementation (feeds watch events to work queue)
-├── manager.go            # manager.Manager implementation (lifecycle orchestration)
-├── builder.go            # Fluent controller builder (NewControllerManagedBy)
 ├── example_test.go       # CRUD, concurrency, and reconciler tests
 ├── docs/migration.md     # Migration guide from controller-runtime
 ├── memory/               # In-memory Store backend
@@ -33,7 +30,7 @@ ctrlforge/                 # Main package — all public API
 
 ### Store (store.go)
 
-The **only interface backend authors implement**. Seven methods: Get, List, Create, Update, Delete, Watch, Apply. Everything else (Client, Cache, Manager) is built on top.
+The **only interface backend authors implement**. Seven methods: Get, List, Create, Update, Delete, Watch, Apply. Everything else (Client, Cache) is built on top.
 
 Error contract matters: return `*NotFoundError`, `*AlreadyExistsError`, `*ConflictError`, `*RevisionTooOldError` so that `apierrors.IsNotFound()` etc. work. These types implement `APIStatus`.
 
@@ -56,7 +53,7 @@ Convenience embeds. `BaseObject` = `metav1.TypeMeta` + `metav1.ObjectMeta`. Type
 
 ## Design decisions
 
-1. **Reuse controller-runtime types, not reinvent them.** We import `client.Object`, `client.ObjectKey`, `cache.Cache`, `manager.Manager`, etc. directly. The goal is minimal code change for controller authors — only the manager creation and builder import change.
+1. **Reuse controller-runtime types, not reinvent them.** We import `client.Object`, `client.ObjectKey`, `cache.Cache`, etc. directly. The goal is minimal code change for controller authors — only the cache and client creation change.
 
 2. **Store is deliberately simple.** It mirrors `client.Reader` + `client.Writer` but without Patch, DeleteAllOf, or SubResources. The `client.Client` wrapper adds those on top (Patch = Get + apply + Update, DeleteAllOf = List + Delete each, Status = just Update). Apply is on Store directly because support varies by backend — each backend explicitly decides.
 
@@ -64,7 +61,7 @@ Convenience embeds. `BaseObject` = `metav1.TypeMeta` + `metav1.ObjectMeta`. Type
 
 4. **Cache is watch-backed.** `storeCache` calls `Store.List` for initial sync, then `Store.Watch` for incremental updates. Reads go to the in-memory cache, not the store. Field indexers work the same as controller-runtime.
 
-5. **Manager stubs K8s-specific features.** Webhooks panic, leader election is always-elected, RESTMapper is empty, EventRecorder logs only. This is intentional — ctrlforge targets non-K8s backends.
+5. **Component library, not a manager replacement.** ctrlforge provides `NewCache` and `NewClient` factory functions. Users wire these into controller-runtime's standard `manager.Manager` via `manager.Options` factory overrides (`NewCache`, `NewClient`). Manager lifecycle, leader election, health probes, and controller builder all stay with controller-runtime.
 
 ## Working with this code
 
@@ -104,7 +101,7 @@ The interfaces we implement come from controller-runtime and evolve across versi
 1. Run `go build ./...` — the compiler will tell you which methods are missing
 2. Check the new interface definitions in `$GOMODCACHE/sigs.k8s.io/controller-runtime@vX.Y.Z/`
 3. Add stub methods for new K8s-specific methods (return "not supported" or no-op)
-4. The critical interfaces to check: `client.Client`, `client.Writer`, `client.SubResourceWriter`, `cache.Cache`, `cache.Informer`, `manager.Manager`, `cluster.Cluster`, `toolscache.ResourceEventHandlerRegistration`
+4. The critical interfaces to check: `client.Client`, `client.Writer`, `client.SubResourceWriter`, `cache.Cache`, `cache.Informer`, `toolscache.ResourceEventHandlerRegistration`
 
 ### Code style
 
@@ -128,4 +125,4 @@ The interfaces we implement come from controller-runtime and evolve across versi
 - Don't add `Patch` or `DeleteAllOf` to Store — those are composed in `client.go` (Apply is different — it's on Store because backend support varies)
 - Don't break `apierrors.Is*` compatibility — always test error types implement `APIStatus`
 - Don't cache in the Store — that's the cache layer's job
-- Don't add leader election tied to K8s — it should be pluggable too (future work)
+- Don't add a custom Manager, Builder, or Source — those belong to controller-runtime. ctrlforge plugs in via factory overrides, not by reimplementing lifecycle orchestration

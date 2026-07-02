@@ -65,8 +65,10 @@ func (c *storeCache) List(ctx context.Context, list client.ObjectList, opts ...c
 	if err != nil {
 		return err
 	}
-	// Convert list GVK to item GVK (e.g., PodList -> Pod)
-	gvk.Kind = gvk.Kind[:len(gvk.Kind)-4] // Remove "List" suffix
+	if len(gvk.Kind) <= 4 || gvk.Kind[len(gvk.Kind)-4:] != "List" {
+		return fmt.Errorf("expected list kind ending in 'List', got %q", gvk.Kind)
+	}
+	gvk.Kind = gvk.Kind[:len(gvk.Kind)-4]
 
 	c.mu.RLock()
 	informer, exists := c.informers[gvk]
@@ -399,7 +401,7 @@ func (i *storeInformer) get(key client.ObjectKey, obj client.Object) error {
 
 	cached, exists := i.objects[key]
 	if !exists {
-		return fmt.Errorf("object not found")
+		return &NotFoundError{Key: key.String()}
 	}
 
 	data, err := json.Marshal(cached)

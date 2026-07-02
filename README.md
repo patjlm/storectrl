@@ -1,6 +1,6 @@
 # ctrlforge
 
-A Go library that provides the [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime) reconciler pattern with pluggable backends. Write controllers using the same `client.Client`, `cache.Cache`, and `manager.Manager` interfaces you already know — but store and watch data from any backend, not just the Kubernetes API server.
+A Go library that provides pluggable `cache.Cache` and `client.Client` implementations for [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime). Write controllers using the standard reconciler pattern — but store and watch data from any backend, not just the Kubernetes API server. Wire ctrlforge into the standard controller-runtime manager via factory overrides; everything else (leader election, metrics, health probes, graceful shutdown) works out of the box.
 
 ## When to use
 
@@ -10,7 +10,7 @@ A Go library that provides the [controller-runtime](https://github.com/kubernete
 
 ## What stays the same
 
-Your reconciler code is unchanged. `r.Get()`, `r.Update()`, `r.Status().Update()`, `apierrors.IsNotFound()`, `apierrors.IsConflict()` — all work identically.
+Everything. Your reconciler code, manager setup, controller builder — all standard controller-runtime. The only difference is two factory overrides when creating the manager.
 
 ```go
 func (r *MyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -124,12 +124,18 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 ### 4. Wire it up with a store
 
+Plug ctrlforge into the standard controller-runtime manager using the `NewCache` and `NewClient` factory overrides:
+
 ```go
 package main
 
 import (
-    "context"
     "log"
+
+    ctrl "sigs.k8s.io/controller-runtime"
+    "sigs.k8s.io/controller-runtime/pkg/cache"
+    "sigs.k8s.io/controller-runtime/pkg/client"
+    "k8s.io/client-go/rest"
 
     "ctrlforge"
     "ctrlforge/memory"
@@ -141,34 +147,29 @@ func main() {
     // Pick a backend — memory, SQL, GCP, etc.
     store := memory.NewStore(scheme)
 
-    mgr, err := ctrlforge.NewManager(store, ctrlforge.ManagerOptions{
+    mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
         Scheme: scheme,
+        NewCache: func(cfg *rest.Config, opts cache.Options) (cache.Cache, error) {
+            return ctrlforge.NewCache(store, scheme), nil
+        },
+        NewClient: func(c cache.Cache, cfg *rest.Config, opts client.Options, uncachedObjects ...client.Object) (client.Client, error) {
+            return ctrlforge.NewClient(store, scheme), nil
+        },
     })
     if err != nil {
         log.Fatal(err)
     }
 
-    // Register the controller — same pattern as controller-runtime
-    ctrlforge.NewControllerManagedBy(mgr).
+    // Register the controller — standard controller-runtime builder
+    ctrl.NewControllerManagedBy(mgr).
         For(&Cluster{}).
         Complete(&ClusterReconciler{Client: mgr.GetClient()})
 
-    // Run
-    if err := mgr.Start(context.Background()); err != nil {
+    // Run — leader election, metrics, health probes all work
+    if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
         log.Fatal(err)
     }
 }
-```
-
-**Compare with standard controller-runtime:**
-
-```go
-// Only these two lines change:
-// Before:  mgr, _ := ctrl.NewManager(restConfig, ctrl.Options{Scheme: scheme})
-// After:   mgr, _ := ctrlforge.NewManager(store, ctrlforge.ManagerOptions{Scheme: scheme})
-//
-// Before:  ctrl.NewControllerManagedBy(mgr)
-// After:   ctrlforge.NewControllerManagedBy(mgr)
 ```
 
 ## Implementing a custom Store
@@ -204,12 +205,14 @@ See `memory/store.go` for a complete reference implementation.
 └───────────────────────┬──────────────────────────┘
                         │ client.Client interface
 ┌───────────────────────┴──────────────────────────┐
-│              ctrlforge.Manager                     │
-│  ┌─────────────┐  ┌──────────┐  ┌─────────────┐ │
-│  │ storeClient │  │storeCache│  │  Builder /   │ │
-│  │(client.Client│  │(cache.   │  │ Controller  │ │
-│  │ impl)       │  │ Cache)   │  │  lifecycle  │ │
-│  └──────┬──────┘  └────┬─────┘  └─────────────┘ │
+│         Standard controller-runtime Manager       │
+│  Leader election, metrics, health probes, ...     │
+│                                                   │
+│  ┌─────────────┐  ┌──────────┐                   │
+│  │ storeClient │  │storeCache│  ← ctrlforge      │
+│  │(client.Client│  │(cache.   │    components     │
+│  │ impl)       │  │ Cache)   │                    │
+│  └──────┬──────┘  └────┬─────┘                   │
 └─────────┼──────────────┼─────────────────────────┘
           │              │
           └──────┬───────┘
@@ -225,11 +228,11 @@ See `memory/store.go` for a complete reference implementation.
 | Backend | Package | Status |
 |---------|---------|--------|
 | In-memory | `ctrlforge/memory` | Ready — maps + channels, thread-safe, optimistic concurrency |
+| Filesystem | `ctrlforge/filesystem` | Ready — JSON files, persisted revision counter |
 
 ## Limitations
 
 - **No admission webhooks** — no API server to serve them
-- **No leader election** — manager always considers itself elected
 - **No API discovery** — RESTMapper is a stub
 - **SubResources beyond `status`** — return unsupported error
 - **Patch** — supports JSON Patch and Merge Patch; strategic merge patch treated as regular merge
