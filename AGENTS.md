@@ -6,7 +6,7 @@ Instructions for AI agents working on this codebase.
 
 storectrl is a Go component library that provides `client.Client` and `cache.Cache` implementations backed by a pluggable `Store` interface instead of the Kubernetes API server. It lets developers write controllers using the standard reconciler pattern against any datastore, wired into controller-runtime's standard `manager.Manager` via factory overrides.
 
-storectrl must scale from small development setups to production workloads with large object counts (100K+ objects). Performance-sensitive areas: relist after watch reconnection, handler call overhead under high event rates, and cache memory footprint with remote backends. See `docs/deltafifo-evaluation.md` for the event processing scalability analysis.
+storectrl must scale from small development setups to production workloads with large object counts (100K+ objects). Performance-sensitive areas: relist after watch reconnection, handler call overhead under high event rates, and cache memory footprint with remote backends.
 
 ## Module layout
 
@@ -17,7 +17,7 @@ storectrl/                 # Main package — all public API
 ├── errors.go             # NotFoundError, AlreadyExistsError, ConflictError, RevisionTooOldError
 ├── object.go             # BaseObject, BaseList (embed for client.Object compat)
 ├── client.go             # client.Client implementation wrapping Store
-├── cache.go              # cache.Cache implementation (watch-backed in-memory cache, CacheOption config)
+├── cache.go              # cache.Cache implementation (watch-backed in-memory cache, async event queue, CacheOption config)
 ├── listerwatcher.go      # StoreListerWatcher adapter (Store → client-go ListerWatcher)
 ├── example_test.go       # CRUD, concurrency, and reconciler tests
 ├── docs/migration.md     # Migration guide from controller-runtime
@@ -62,7 +62,15 @@ Convenience embeds. `BaseObject` = `metav1.TypeMeta` + `metav1.ObjectMeta`. Type
 
 3. **Errors implement `APIStatus`.** This is critical for transparent swapping. Controller code universally uses `apierrors.IsNotFound(err)` — our errors must satisfy that check without code changes.
 
-4. **Cache is watch-backed and configurable.** `storeCache` calls `Store.List` for initial sync, then `Store.Watch` for incremental updates. Reads go to the in-memory cache, not the store. Field indexers work the same as controller-runtime. Configuration uses functional options (`CacheOption`) passed to `NewCache` — see design decision #6.
+4. **Cache is watch-backed with async event processing.** `storeCache` calls `Store.List` for initial sync, then `Store.Watch` for incremental updates. Reads go to the in-memory cache, not the store. Field indexers work the same as controller-runtime. Configuration uses functional options (`CacheOption`) passed to `NewCache` — see design decision #6. Two scalability features handle high event rates and relist overhead:
+
+   **Async event queue** — Handler calls are decoupled from the watch goroutine via `eventQueue`, a per-key coalescing queue. The watch goroutine updates the cache map and enqueues; a processor goroutine drains and calls handlers. This prevents slow handlers from blocking the watch channel and triggering overflow→relist cascades. Coalescing rules: Add+Update→Add (latest state), Add+Delete→cancel (no handler call), Update+Update→merge (oldest oldObj, latest obj), Update+Delete→Delete, Delete+Add→preserve both (OnDelete then OnAdd). `AddEventHandler` still delivers its initial snapshot synchronously to the new handler — only watch-driven events go through the queue.
+
+   **Smart relist diff** — On relist (after `RevisionTooOldError`), `replaceAll` diffs old vs new objects by `ResourceVersion`: unchanged objects (same RV) produce no handler call, new objects fire `OnAdd`, changed objects fire `OnUpdate`, removed objects fire `OnDelete`. This reduces relist cost from O(N) to O(changed).
+
+   **Ordering** — Events within a drain cycle are delivered in enqueue order, matching watch arrival order. Per-key coalescing reduces event count but does not reorder across keys.
+
+   **What this doesn't cover** — Full delta history per object (seeing every intermediate state). This matters for edge-triggered controllers that need to observe every state transition. For those use cases, use the `StoreListerWatcher` adapter (`listerwatcher.go`) which delegates to controller-runtime's `SharedIndexInformer` and gets DeltaFIFO.
 
 5. **Component library, not a manager replacement.** storectrl provides `NewCache` and `NewClient` factory functions. Users wire these into controller-runtime's standard `manager.Manager` via `manager.Options` factory overrides (`NewCache`, `NewClient`). Manager lifecycle, leader election, health probes, and controller builder all stay with controller-runtime.
 

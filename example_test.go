@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1509,5 +1510,295 @@ func TestCacheWithEnableWatchBookmarks(t *testing.T) {
 	}
 	if got.Spec.Color != "blue" {
 		t.Errorf("expected blue, got %s", got.Spec.Color)
+	}
+}
+
+func TestSmartReplaceAllSkipsUnchanged(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	scheme := testScheme()
+	store := memory.NewStore(scheme, memory.WithEventLogSize(5))
+	c := storectrl.NewCache(store, scheme)
+
+	informer, err := c.GetInformer(ctx, &Widget{})
+	if err != nil {
+		t.Fatalf("get informer: %v", err)
+	}
+
+	go func() { _ = c.Start(ctx) }()
+	if !c.WaitForCacheSync(ctx) {
+		t.Fatal("cache never synced")
+	}
+
+	// Create 5 widgets
+	for i := 0; i < 5; i++ {
+		w := newWidget(fmt.Sprintf("w%d", i), "blue", i)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create w%d: %v", i, err)
+		}
+	}
+
+	// Wait for cache to see all 5
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		list := &WidgetList{}
+		if err := c.List(ctx, list); err == nil && len(list.Items) == 5 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Register handler AFTER initial sync to count only relist events
+	var addCount, updateCount, deleteCount atomic.Int32
+	_, err = informer.AddEventHandler(toolscache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj interface{}) { addCount.Add(1) },
+		UpdateFunc: func(_, _ interface{}) { updateCount.Add(1) },
+		DeleteFunc: func(obj interface{}) { deleteCount.Add(1) },
+	})
+	if err != nil {
+		t.Fatalf("add handler: %v", err)
+	}
+
+	// Wait for AddEventHandler's snapshot delivery to settle
+	time.Sleep(100 * time.Millisecond)
+	addCount.Store(0)
+	updateCount.Store(0)
+	deleteCount.Store(0)
+
+	// Update only 1 of the 5 widgets, then create enough events to
+	// overflow the event log and force a relist
+	w0 := &Widget{}
+	if err := store.Get(ctx, client.ObjectKey{Namespace: "default", Name: "w0"}, w0); err != nil {
+		t.Fatalf("get w0: %v", err)
+	}
+	w0.Spec.Color = "red"
+	if err := store.Update(ctx, w0); err != nil {
+		t.Fatalf("update w0: %v", err)
+	}
+
+	// Flood event log to trigger RevisionTooOldError → relist
+	for i := 10; i < 20; i++ {
+		w := newWidget(fmt.Sprintf("flood-%d", i), "gray", i)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create flood: %v", err)
+		}
+	}
+
+	// Wait for relist recovery to complete
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		list := &WidgetList{}
+		if err := c.List(ctx, list); err == nil && len(list.Items) == 15 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	list := &WidgetList{}
+	if err := c.List(ctx, list); err != nil || len(list.Items) != 15 {
+		t.Fatalf("expected 15 widgets after relist, got %d", len(list.Items))
+	}
+
+	// Wait for async event processing to finish
+	time.Sleep(200 * time.Millisecond)
+
+	// Smart replaceAll: w0 changed → OnUpdate(1), flood objects new → OnAdd(10),
+	// w1-w4 unchanged → no event. Without smart diff, we'd see 15 OnAdd calls.
+	adds := addCount.Load()
+	updates := updateCount.Load()
+	deletes := deleteCount.Load()
+
+	if adds != 10 {
+		t.Errorf("expected 10 adds (flood objects), got %d", adds)
+	}
+	if deletes != 0 {
+		t.Errorf("expected 0 deletes, got %d", deletes)
+	}
+	// w0 changed RV → should be OnUpdate, not OnAdd
+	if updates < 1 {
+		t.Errorf("expected at least 1 update (w0 changed), got %d", updates)
+	}
+}
+
+func TestAsyncEventCoalescing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	scheme := testScheme()
+	store := memory.NewStore(scheme, memory.WithEventLogSize(1000))
+	c := storectrl.NewCache(store, scheme)
+
+	informer, err := c.GetInformer(ctx, &Widget{})
+	if err != nil {
+		t.Fatalf("get informer: %v", err)
+	}
+
+	go func() { _ = c.Start(ctx) }()
+	if !c.WaitForCacheSync(ctx) {
+		t.Fatal("cache never synced")
+	}
+
+	// Track handler calls per object
+	var totalUpdates atomic.Int32
+	_, err = informer.AddEventHandler(toolscache.ResourceEventHandlerFuncs{
+		UpdateFunc: func(_, _ interface{}) {
+			totalUpdates.Add(1)
+		},
+	})
+	if err != nil {
+		t.Fatalf("add handler: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	w := newWidget("burst", "blue", 1)
+	if err := store.Create(ctx, w); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Wait for cache to see the create
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "burst"}, &Widget{}); err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	totalUpdates.Store(0)
+
+	// Rapid-fire 50 updates — coalescing should reduce handler calls
+	for i := 0; i < 50; i++ {
+		w.Spec.Size = i + 100
+		if err := store.Update(ctx, w); err != nil {
+			t.Fatalf("update %d: %v", i, err)
+		}
+	}
+
+	// Wait for processing to settle
+	time.Sleep(500 * time.Millisecond)
+
+	updates := totalUpdates.Load()
+	// With coalescing, we should see fewer than 50 update handler calls.
+	// Without coalescing, each update triggers a handler call = 50.
+	if updates >= 50 {
+		t.Errorf("expected coalescing to reduce updates below 50, got %d", updates)
+	}
+	if updates == 0 {
+		t.Error("expected at least some updates to be delivered")
+	}
+
+	// Cache should reflect the final state
+	got := &Widget{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "burst"}, got); err != nil {
+		t.Fatalf("get after burst: %v", err)
+	}
+	if got.Spec.Size != 149 {
+		t.Errorf("expected final size=149, got %d", got.Spec.Size)
+	}
+}
+
+func TestDeleteAddPreservation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	scheme := testScheme()
+	store := memory.NewStore(scheme, memory.WithEventLogSize(1000))
+	c := storectrl.NewCache(store, scheme)
+
+	informer, err := c.GetInformer(ctx, &Widget{})
+	if err != nil {
+		t.Fatalf("get informer: %v", err)
+	}
+
+	go func() { _ = c.Start(ctx) }()
+	if !c.WaitForCacheSync(ctx) {
+		t.Fatal("cache never synced")
+	}
+
+	phoenix := newWidget("phoenix", "blue", 1)
+	if err := store.Create(ctx, phoenix); err != nil {
+		t.Fatalf("create phoenix: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "phoenix"}, &Widget{}); err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "phoenix"}, &Widget{}); err != nil {
+		t.Fatalf("cache never saw phoenix: %v", err)
+	}
+
+	var mu sync.Mutex
+	var events []string
+	_, err = informer.AddEventHandler(toolscache.ResourceEventHandlerFuncs{
+		AddFunc: func(_ interface{}) {
+			mu.Lock()
+			events = append(events, "add")
+			mu.Unlock()
+		},
+		UpdateFunc: func(_, _ interface{}) {
+			mu.Lock()
+			events = append(events, "update")
+			mu.Unlock()
+		},
+		DeleteFunc: func(_ interface{}) {
+			mu.Lock()
+			events = append(events, "delete")
+			mu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatalf("add handler: %v", err)
+	}
+
+	// Wait for snapshot delivery, then reset
+	time.Sleep(100 * time.Millisecond)
+	mu.Lock()
+	events = nil
+	mu.Unlock()
+
+	// Delete then immediately re-create with different attributes
+	if err := store.Delete(ctx, phoenix); err != nil {
+		t.Fatalf("delete phoenix: %v", err)
+	}
+	phoenix2 := newWidget("phoenix", "red", 2)
+	if err := store.Create(ctx, phoenix2); err != nil {
+		t.Fatalf("re-create phoenix: %v", err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	mu.Lock()
+	got := make([]string, len(events))
+	copy(got, events)
+	mu.Unlock()
+
+	hasDelete := false
+	hasAdd := false
+	for _, e := range got {
+		switch e {
+		case "delete":
+			hasDelete = true
+		case "add":
+			hasAdd = true
+		}
+	}
+	if !hasDelete || !hasAdd {
+		t.Errorf("expected both delete and add events, got %v", got)
+	}
+
+	// Verify cache has the new widget with updated attributes
+	final := &Widget{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "phoenix"}, final); err != nil {
+		t.Fatalf("get phoenix after re-create: %v", err)
+	}
+	if final.Spec.Color != "red" {
+		t.Errorf("expected color=red, got %s", final.Spec.Color)
+	}
+	if final.Spec.Size != 2 {
+		t.Errorf("expected size=2, got %d", final.Spec.Size)
 	}
 }

@@ -163,6 +163,121 @@ func TransformStripManagedFields() toolscache.TransformFunc {
 	}
 }
 
+// cacheEventType represents the type of cache event for async handler delivery.
+type cacheEventType int
+
+const (
+	cacheEventAdd cacheEventType = iota
+	cacheEventUpdate
+	cacheEventDelete
+)
+
+// cacheEvent represents a pending event in the async processing queue.
+type cacheEvent struct {
+	eventType       cacheEventType
+	obj             client.Object
+	oldObj          client.Object // only for cacheEventUpdate
+	isInInitialList bool
+}
+
+// eventQueue provides per-key coalescing of events for async handler delivery.
+// Multiple updates to the same object between processor cycles are merged into
+// a single event, reducing handler call overhead under high event rates.
+type eventQueue struct {
+	mu      sync.Mutex
+	cond    *sync.Cond
+	order   []client.ObjectKey
+	pending map[client.ObjectKey][]*cacheEvent
+	closed  bool
+}
+
+func newEventQueue() *eventQueue {
+	q := &eventQueue{
+		pending: make(map[client.ObjectKey][]*cacheEvent),
+	}
+	q.cond = sync.NewCond(&q.mu)
+	return q
+}
+
+func (q *eventQueue) enqueue(key client.ObjectKey, evt *cacheEvent) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed {
+		return
+	}
+	existing, exists := q.pending[key]
+	if !exists {
+		q.pending[key] = []*cacheEvent{evt}
+		q.order = append(q.order, key)
+	} else {
+		last := existing[len(existing)-1]
+		if last.eventType == cacheEventDelete && evt.eventType == cacheEventAdd {
+			q.pending[key] = append(existing, evt)
+		} else {
+			coalesced := coalesceEvents(last, evt)
+			if coalesced == nil {
+				existing = existing[:len(existing)-1]
+				if len(existing) == 0 {
+					delete(q.pending, key)
+				} else {
+					q.pending[key] = existing
+				}
+			} else {
+				existing[len(existing)-1] = coalesced
+			}
+		}
+	}
+	q.cond.Signal()
+}
+
+func coalesceEvents(existing, incoming *cacheEvent) *cacheEvent {
+	switch {
+	case existing.eventType == cacheEventAdd && incoming.eventType == cacheEventUpdate:
+		return &cacheEvent{eventType: cacheEventAdd, obj: incoming.obj, isInInitialList: existing.isInInitialList}
+	case existing.eventType == cacheEventAdd && incoming.eventType == cacheEventDelete:
+		return nil
+	case existing.eventType == cacheEventUpdate && incoming.eventType == cacheEventUpdate:
+		return &cacheEvent{eventType: cacheEventUpdate, oldObj: existing.oldObj, obj: incoming.obj}
+	case existing.eventType == cacheEventUpdate && incoming.eventType == cacheEventDelete:
+		return &cacheEvent{eventType: cacheEventDelete, obj: incoming.obj}
+	default:
+		return incoming
+	}
+}
+
+// drain blocks until events are available (or the queue is closed), then
+// returns all pending events and resets the pending map. Returns nil when
+// the queue is closed and empty.
+type drainResult struct {
+	order  []client.ObjectKey
+	events map[client.ObjectKey][]*cacheEvent
+}
+
+func (q *eventQueue) drain() *drainResult {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for len(q.pending) == 0 && !q.closed {
+		q.cond.Wait()
+	}
+	if q.closed && len(q.pending) == 0 {
+		return nil
+	}
+	result := &drainResult{
+		order:  q.order,
+		events: q.pending,
+	}
+	q.order = nil
+	q.pending = make(map[client.ObjectKey][]*cacheEvent)
+	return result
+}
+
+func (q *eventQueue) close() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.closed = true
+	q.cond.Broadcast()
+}
+
 // storeCache implements cache.Cache backed by a Store.
 type storeCache struct {
 	store  Store
@@ -416,6 +531,8 @@ func (c *storeCache) Start(ctx context.Context) error {
 }
 
 func (c *storeCache) startInformer(ctx context.Context, informer *storeInformer) error {
+	informer.startProcessing(ctx)
+
 	// Create a list object for this type
 	listGVK := informer.gvk
 	listGVK.Kind = listGVK.Kind + "List"
@@ -585,23 +702,18 @@ func (c *storeCache) watchInformer(ctx context.Context, informer *storeInformer,
 
 func (c *storeCache) resyncInformer(informer *storeInformer) {
 	informer.mu.RLock()
-	objects := make([]client.Object, 0, len(informer.objects))
-	for _, obj := range informer.objects {
-		objects = append(objects, obj.DeepCopyObject().(client.Object))
+	snapshot := make(map[client.ObjectKey]client.Object, len(informer.objects))
+	for key, obj := range informer.objects {
+		snapshot[key] = obj.DeepCopyObject().(client.Object)
 	}
 	informer.mu.RUnlock()
 
-	informer.handlerMu.RLock()
-	handlers := make([]toolscache.ResourceEventHandler, len(informer.handlers))
-	for idx, h := range informer.handlers {
-		handlers[idx] = h.handler
-	}
-	informer.handlerMu.RUnlock()
-
-	for _, obj := range objects {
-		for _, h := range handlers {
-			h.OnUpdate(obj, obj)
-		}
+	for key, objCopy := range snapshot {
+		informer.queue.enqueue(key, &cacheEvent{
+			eventType: cacheEventUpdate,
+			oldObj:    objCopy,
+			obj:       objCopy,
+		})
 	}
 }
 
@@ -698,6 +810,7 @@ type storeInformer struct {
 	stopped  bool
 	watcher  Watcher
 
+	queue  *eventQueue
 	config informerConfig
 }
 
@@ -715,6 +828,7 @@ func newStoreInformer(gvk schema.GroupVersionKind, obj client.Object, scheme *ru
 		indices:  make(map[string]map[string][]client.ObjectKey),
 		handlers: make([]handlerRegistration, 0),
 		syncedCh: make(chan struct{}),
+		queue:    newEventQueue(),
 		config:   config,
 	}
 }
@@ -917,16 +1031,10 @@ func (i *storeInformer) add(obj client.Object) {
 	i.rebuildIndicesForObject(key, transformed)
 	i.mu.Unlock()
 
-	i.handlerMu.RLock()
-	handlers := make([]toolscache.ResourceEventHandler, len(i.handlers))
-	for idx, h := range i.handlers {
-		handlers[idx] = h.handler
-	}
-	i.handlerMu.RUnlock()
-
-	for _, handler := range handlers {
-		handler.OnAdd(transformed, false)
-	}
+	i.queue.enqueue(key, &cacheEvent{
+		eventType: cacheEventAdd,
+		obj:       transformed,
+	})
 }
 
 func (i *storeInformer) update(obj client.Object) {
@@ -934,7 +1042,6 @@ func (i *storeInformer) update(obj client.Object) {
 	key := client.ObjectKeyFromObject(obj)
 
 	if !matches {
-		// Object no longer matches selectors — remove from cache if present
 		i.mu.Lock()
 		cached, existed := i.objects[key]
 		if existed {
@@ -944,16 +1051,10 @@ func (i *storeInformer) update(obj client.Object) {
 		i.mu.Unlock()
 
 		if existed {
-			i.handlerMu.RLock()
-			handlers := make([]toolscache.ResourceEventHandler, len(i.handlers))
-			for idx, h := range i.handlers {
-				handlers[idx] = h.handler
-			}
-			i.handlerMu.RUnlock()
-
-			for _, handler := range handlers {
-				handler.OnDelete(cached)
-			}
+			i.queue.enqueue(key, &cacheEvent{
+				eventType: cacheEventDelete,
+				obj:       cached,
+			})
 		}
 		return
 	}
@@ -969,22 +1070,18 @@ func (i *storeInformer) update(obj client.Object) {
 	i.rebuildIndicesForObject(key, transformed)
 	i.mu.Unlock()
 
-	i.handlerMu.RLock()
-	handlers := make([]toolscache.ResourceEventHandler, len(i.handlers))
-	for idx, h := range i.handlers {
-		handlers[idx] = h.handler
-	}
-	i.handlerMu.RUnlock()
-
 	if !exists {
-		for _, handler := range handlers {
-			handler.OnAdd(transformed, false)
-		}
+		i.queue.enqueue(key, &cacheEvent{
+			eventType: cacheEventAdd,
+			obj:       transformed,
+		})
 		return
 	}
-	for _, handler := range handlers {
-		handler.OnUpdate(oldObj, transformed)
-	}
+	i.queue.enqueue(key, &cacheEvent{
+		eventType: cacheEventUpdate,
+		oldObj:    oldObj,
+		obj:       transformed,
+	})
 }
 
 func (i *storeInformer) delete(obj client.Object) {
@@ -999,16 +1096,10 @@ func (i *storeInformer) delete(obj client.Object) {
 	i.mu.Unlock()
 
 	if exists {
-		i.handlerMu.RLock()
-		handlers := make([]toolscache.ResourceEventHandler, len(i.handlers))
-		for idx, h := range i.handlers {
-			handlers[idx] = h.handler
-		}
-		i.handlerMu.RUnlock()
-
-		for _, handler := range handlers {
-			handler.OnDelete(cached)
-		}
+		i.queue.enqueue(key, &cacheEvent{
+			eventType: cacheEventDelete,
+			obj:       cached,
+		})
 	}
 }
 
@@ -1093,26 +1184,77 @@ func (i *storeInformer) replaceAll(items []runtime.Object) {
 	newObjects := i.objects
 	i.mu.Unlock()
 
-	i.handlerMu.RLock()
-	handlers := make([]toolscache.ResourceEventHandler, len(i.handlers))
-	for idx, h := range i.handlers {
-		handlers[idx] = h.handler
-	}
-	i.handlerMu.RUnlock()
-
 	for key, obj := range oldObjects {
 		if _, exists := newObjects[key]; !exists {
-			objCopy := obj.DeepCopyObject().(client.Object)
-			for _, h := range handlers {
-				h.OnDelete(objCopy)
-			}
+			i.queue.enqueue(key, &cacheEvent{
+				eventType: cacheEventDelete,
+				obj:       obj,
+			})
 		}
 	}
 
-	for _, obj := range newObjects {
-		objCopy := obj.DeepCopyObject().(client.Object)
-		for _, h := range handlers {
-			h.OnAdd(objCopy, true)
+	for key, obj := range newObjects {
+		oldObj, existed := oldObjects[key]
+		if !existed {
+			i.queue.enqueue(key, &cacheEvent{
+				eventType:       cacheEventAdd,
+				obj:             obj.DeepCopyObject().(client.Object),
+				isInInitialList: true,
+			})
+		} else if oldObj.GetResourceVersion() != obj.GetResourceVersion() {
+			i.queue.enqueue(key, &cacheEvent{
+				eventType: cacheEventUpdate,
+				oldObj:    oldObj,
+				obj:       obj.DeepCopyObject().(client.Object),
+			})
+		}
+	}
+}
+
+func (i *storeInformer) startProcessing(ctx context.Context) {
+	go func() {
+		<-ctx.Done()
+		i.queue.close()
+	}()
+	go i.processEvents()
+}
+
+func (i *storeInformer) processEvents() {
+	for {
+		result := i.queue.drain()
+		if result == nil {
+			return
+		}
+
+		i.handlerMu.RLock()
+		handlers := make([]toolscache.ResourceEventHandler, len(i.handlers))
+		for idx, h := range i.handlers {
+			handlers[idx] = h.handler
+		}
+		i.handlerMu.RUnlock()
+
+		seen := make(map[client.ObjectKey]bool, len(result.events))
+		for _, key := range result.order {
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			for _, evt := range result.events[key] {
+				switch evt.eventType {
+				case cacheEventAdd:
+					for _, h := range handlers {
+						h.OnAdd(evt.obj, evt.isInInitialList)
+					}
+				case cacheEventUpdate:
+					for _, h := range handlers {
+						h.OnUpdate(evt.oldObj, evt.obj)
+					}
+				case cacheEventDelete:
+					for _, h := range handlers {
+						h.OnDelete(evt.obj)
+					}
+				}
+			}
 		}
 	}
 }
@@ -1137,6 +1279,7 @@ func (i *storeInformer) stop() {
 	defer i.mu.Unlock()
 
 	i.stopped = true
+	i.queue.close()
 	if i.watcher != nil {
 		i.watcher.Stop()
 	}
