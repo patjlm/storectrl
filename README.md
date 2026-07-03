@@ -1,6 +1,8 @@
 # storectrl
 
-A Go library that provides pluggable `cache.Cache` and `client.Client` implementations for [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime). Write controllers using the standard reconciler pattern — but store and watch data from any backend, not just the Kubernetes API server. Wire storectrl into the standard controller-runtime manager via factory overrides; everything else (leader election, metrics, health probes, graceful shutdown) works out of the box.
+A Go library that provides pluggable `cache.Cache` and `client.Client` implementations for [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime). Write controllers using the standard reconciler pattern — but store and watch data from any backend, not just the Kubernetes API server.
+
+storectrl plugs into the standard controller-runtime manager via factory overrides. Everything else — leader election, metrics, health probes, graceful shutdown — works out of the box.
 
 ## When to use
 
@@ -8,53 +10,44 @@ A Go library that provides pluggable `cache.Cache` and `client.Client` implement
 - Prototyping controllers with a fast **in-memory backend** before wiring up a real store
 - Running controller logic in **unit tests** without a real kube-apiserver or envtest
 
-## What stays the same
+## Architecture
 
-Everything. Your reconciler code, manager setup, controller builder — all standard controller-runtime. The only difference is two factory overrides when creating the manager.
-
-```go
-func (r *MyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-    obj := &MyResource{}
-    if err := r.Get(ctx, req.NamespacedName, obj); err != nil {
-        return ctrl.Result{}, client.IgnoreNotFound(err)
-    }
-    // ... business logic ...
-    return ctrl.Result{}, r.Status().Update(ctx, obj)
-}
+```
+┌──────────────────────────────────────────────────┐
+│                  Your Controller                  │
+│  Reconcile(ctx, req) → r.Get / r.Update / ...    │
+└───────────────────────┬──────────────────────────┘
+                        │ client.Client interface
+┌───────────────────────┴──────────────────────────┐
+│         Standard controller-runtime Manager       │
+│  Leader election, metrics, health probes, ...     │
+│                                                   │
+│  ┌─────────────┐  ┌──────────┐                   │
+│  │ storeClient │  │storeCache│  ← storectrl      │
+│  │(client.Client│  │(cache.   │    components     │
+│  │ impl)       │  │ Cache)   │                    │
+│  └──────┬──────┘  └────┬─────┘                   │
+└─────────┼──────────────┼─────────────────────────┘
+          │              │
+          └──────┬───────┘
+                 │ storectrl.Store interface
+    ┌────────────┴────────────────┐
+    │    Backend Implementation    │
+    │  memory │ SQL │ GCP │ ...   │
+    └─────────────────────────────┘
 ```
 
 ## Quick start
 
 ### 1. Define your types
 
-Embed `storectrl.BaseObject` (which provides `TypeMeta` + `ObjectMeta`) and implement `DeepCopyObject`:
+Embed `storectrl.BaseObject` and implement `DeepCopyObject`:
 
 ```go
-package mycontroller
-
-import (
-    "k8s.io/apimachinery/pkg/runtime"
-    "k8s.io/apimachinery/pkg/runtime/schema"
-    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-    "storectrl"
-)
-
-var GroupVersion = schema.GroupVersion{Group: "myapp.example.com", Version: "v1"}
-
 type Cluster struct {
     storectrl.BaseObject `json:",inline"`
     Spec                ClusterSpec   `json:"spec"`
     Status              ClusterStatus `json:"status"`
-}
-
-type ClusterSpec struct {
-    Region   string `json:"region"`
-    NodeCount int   `json:"nodeCount"`
-}
-
-type ClusterStatus struct {
-    Phase string `json:"phase"`
-    Ready bool   `json:"ready"`
 }
 
 func (c *Cluster) DeepCopyObject() runtime.Object {
@@ -84,6 +77,8 @@ func (c *ClusterList) DeepCopyObject() runtime.Object {
 ### 2. Register types with a scheme
 
 ```go
+var GroupVersion = schema.GroupVersion{Group: "myapp.example.com", Version: "v1"}
+
 func NewScheme() *runtime.Scheme {
     s := runtime.NewScheme()
     s.AddKnownTypes(GroupVersion, &Cluster{}, &ClusterList{})
@@ -92,7 +87,7 @@ func NewScheme() *runtime.Scheme {
 }
 ```
 
-### 3. Write the reconciler
+### 3. Write a reconciler
 
 Standard controller-runtime reconciler — no storectrl-specific code:
 
@@ -106,129 +101,44 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
     if err := r.Get(ctx, req.NamespacedName, cluster); err != nil {
         return ctrl.Result{}, client.IgnoreNotFound(err)
     }
-
-    // Reconcile desired vs actual state
-    cluster.Status.Ready = cluster.Spec.NodeCount > 0
-    if cluster.Status.Ready {
-        cluster.Status.Phase = "Running"
-    } else {
-        cluster.Status.Phase = "Pending"
-    }
-
-    if err := r.Status().Update(ctx, cluster); err != nil {
-        return ctrl.Result{}, err
-    }
-    return ctrl.Result{}, nil
+    // ... business logic ...
+    return ctrl.Result{}, r.Status().Update(ctx, cluster)
 }
 ```
 
 ### 4. Wire it up with a store
 
-Plug storectrl into the standard controller-runtime manager using the `NewCache` and `NewClient` factory overrides:
+Override `NewCache` and `NewClient` in the standard manager options:
 
 ```go
-package main
+scheme := NewScheme()
+store := memory.NewStore(scheme)
 
-import (
-    "log"
+mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+    Scheme: scheme,
+    NewCache: func(cfg *rest.Config, opts cache.Options) (cache.Cache, error) {
+        return storectrl.NewCache(store, scheme), nil
+    },
+    NewClient: func(c cache.Cache, cfg *rest.Config, opts client.Options, uncachedObjects ...client.Object) (client.Client, error) {
+        return storectrl.NewClient(store, scheme), nil
+    },
+})
 
-    ctrl "sigs.k8s.io/controller-runtime"
-    "sigs.k8s.io/controller-runtime/pkg/cache"
-    "sigs.k8s.io/controller-runtime/pkg/client"
-    "k8s.io/client-go/rest"
+ctrl.NewControllerManagedBy(mgr).
+    For(&Cluster{}).
+    Complete(&ClusterReconciler{Client: mgr.GetClient()})
 
-    "storectrl"
-    "storectrl/memory"
-)
-
-func main() {
-    scheme := NewScheme()
-
-    // Pick a backend — memory, SQL, GCP, etc.
-    store := memory.NewStore(scheme)
-
-    mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-        Scheme: scheme,
-        NewCache: func(cfg *rest.Config, opts cache.Options) (cache.Cache, error) {
-            return storectrl.NewCache(store, scheme), nil
-        },
-        NewClient: func(c cache.Cache, cfg *rest.Config, opts client.Options, uncachedObjects ...client.Object) (client.Client, error) {
-            return storectrl.NewClient(store, scheme), nil
-        },
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    // Register the controller — standard controller-runtime builder
-    ctrl.NewControllerManagedBy(mgr).
-        For(&Cluster{}).
-        Complete(&ClusterReconciler{Client: mgr.GetClient()})
-
-    // Run — leader election, metrics, health probes all work
-    if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-        log.Fatal(err)
-    }
-}
+mgr.Start(ctrl.SetupSignalHandler())
 ```
 
-## Implementing a custom Store
-
-Implement the `Store` interface to connect any backend:
-
-```go
-type Store interface {
-    Get(ctx context.Context, key client.ObjectKey, obj client.Object) error
-    List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error
-    Create(ctx context.Context, obj client.Object) error
-    Update(ctx context.Context, obj client.Object) error
-    Delete(ctx context.Context, obj client.Object) error
-    Watch(ctx context.Context, list client.ObjectList, opts ...client.ListOption) (Watcher, error)
-    Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.ApplyOption) error
-}
-```
-
-**Error contract:** Return `*storectrl.NotFoundError`, `*storectrl.AlreadyExistsError`, or `*storectrl.ConflictError` — they implement the `APIStatus` interface so `apierrors.IsNotFound()` etc. work transparently.
-
-**Optimistic concurrency:** Check `ResourceVersion` on Update and return `ConflictError` on mismatch. Set `UID` and `ResourceVersion` on Create.
-
-**Watch:** Return a `Watcher` that streams `Event{Type, Object}` on a channel. Implementation depends on the backend — Postgres LISTEN/NOTIFY, GCP Pub/Sub, polling, etc.
-
-See `memory/store.go` for a complete reference implementation.
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────┐
-│                  Your Controller                  │
-│  Reconcile(ctx, req) → r.Get / r.Update / ...    │
-└───────────────────────┬──────────────────────────┘
-                        │ client.Client interface
-┌───────────────────────┴──────────────────────────┐
-│         Standard controller-runtime Manager       │
-│  Leader election, metrics, health probes, ...     │
-│                                                   │
-│  ┌─────────────┐  ┌──────────┐                   │
-│  │ storeClient │  │storeCache│  ← storectrl      │
-│  │(client.Client│  │(cache.   │    components     │
-│  │ impl)       │  │ Cache)   │                    │
-│  └──────┬──────┘  └────┬─────┘                   │
-└─────────┼──────────────┼─────────────────────────┘
-          │              │
-          └──────┬───────┘
-                 │ storectrl.Store interface
-    ┌────────────┴────────────────┐
-    │    Backend Implementation    │
-    │  memory │ SQL │ GCP │ ...   │
-    └─────────────────────────────┘
-```
+For a complete working example, see [example_test.go](example_test.go).
 
 ## Included backends
 
-| Backend | Package | Status |
-|---------|---------|--------|
-| In-memory | `storectrl/memory` | Ready — maps + channels, thread-safe, optimistic concurrency |
-| Filesystem | `storectrl/filesystem` | Ready — JSON files, persisted revision counter |
+| Backend | Package | Description |
+|---------|---------|-------------|
+| In-memory | `storectrl/memory` | Maps + channels, thread-safe, optimistic concurrency |
+| Filesystem | `storectrl/filesystem` | JSON files, persisted revision counter |
 
 ## Limitations
 
@@ -236,9 +146,7 @@ See `memory/store.go` for a complete reference implementation.
 - **No API discovery** — RESTMapper is a stub
 - **SubResources beyond `status`** — return unsupported error
 - **Patch** — supports JSON Patch and Merge Patch; strategic merge patch treated as regular merge
-- **Apply** — delegated to Store backend; backends that don't support it return an error (e.g. the in-memory store)
-
-See [docs/migration.md](docs/migration.md) for a detailed migration guide.
+- **Apply** — delegated to Store backend; backends that don't support it return an error
 
 ## Dependencies
 
@@ -246,3 +154,10 @@ See [docs/migration.md](docs/migration.md) for a detailed migration guide.
 - `sigs.k8s.io/controller-runtime` v0.24+
 - `k8s.io/apimachinery` v0.36+
 - `k8s.io/client-go` v0.36+
+
+## Further reading
+
+- [Components & usage](docs/usage.md) — what each component provides vs CR, compositions, cache options
+- [Implementing a Store backend](docs/backends.md) — Store interface, error contracts, watch resumption
+- [Migrating from controller-runtime](docs/migration.md) — before/after comparison, type compatibility
+- [Wiring examples](wiring_test.go) — runnable tests for each component and composition
