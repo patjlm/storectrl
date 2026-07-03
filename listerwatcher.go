@@ -222,10 +222,12 @@ func (a *initialEventsAdapter) run(items []runtime.Object, bookmarkObj runtime.O
 		}
 	}
 
-	select {
-	case a.ch <- watch.Event{Type: watch.Bookmark, Object: bookmarkObj}:
-	case <-a.stopCh:
-		return
+	if bookmarkObj != nil {
+		select {
+		case a.ch <- watch.Event{Type: watch.Bookmark, Object: bookmarkObj}:
+		case <-a.stopCh:
+			return
+		}
 	}
 
 	for {
@@ -278,6 +280,9 @@ func bookmarkForList(listObj client.ObjectList, rv string) runtime.Object {
 		listVal = listVal.Elem()
 	}
 	itemsField := listVal.FieldByName("Items")
+	if !itemsField.IsValid() {
+		return nil
+	}
 	obj := reflect.New(itemsField.Type().Elem()).Interface().(client.Object)
 	obj.SetResourceVersion(rv)
 	obj.SetAnnotations(map[string]string{
