@@ -17,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
 	toolscache "k8s.io/client-go/tools/cache"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -1801,4 +1802,158 @@ func TestDeleteAddPreservation(t *testing.T) {
 	if final.Spec.Size != 2 {
 		t.Errorf("expected size=2, got %d", final.Spec.Size)
 	}
+}
+
+func TestStoreListerWatcherSendInitialEvents(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme()
+	store := memory.NewStore(scheme)
+
+	for i := 0; i < 3; i++ {
+		w := newWidget(fmt.Sprintf("w%d", i), "blue", i)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+	}
+
+	slw := storectrl.NewStoreListerWatcher(store, &WidgetList{})
+
+	sendInitial := true
+	watcher, err := slw.WatchWithContext(ctx, metav1.ListOptions{
+		SendInitialEvents: &sendInitial,
+	})
+	if err != nil {
+		t.Fatalf("watch: %v", err)
+	}
+	defer watcher.Stop()
+
+	// Should receive 3 ADDED events
+	for i := 0; i < 3; i++ {
+		select {
+		case evt := <-watcher.ResultChan():
+			if evt.Type != watch.Added {
+				t.Errorf("event %d: expected ADDED, got %s", i, evt.Type)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timeout at event %d", i)
+		}
+	}
+
+	// Then a BOOKMARK with the initial-events-end annotation
+	select {
+	case evt := <-watcher.ResultChan():
+		if evt.Type != watch.Bookmark {
+			t.Fatalf("expected BOOKMARK, got %s", evt.Type)
+		}
+		obj := evt.Object.(client.Object)
+		if obj.GetAnnotations()[metav1.InitialEventsAnnotationKey] != "true" {
+			t.Error("bookmark missing initial-events-end annotation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for bookmark")
+	}
+
+	// Live events should still flow
+	w3 := newWidget("w3", "green", 3)
+	if err := store.Create(ctx, w3); err != nil {
+		t.Fatalf("create w3: %v", err)
+	}
+
+	select {
+	case evt := <-watcher.ResultChan():
+		if evt.Type != watch.Added || evt.Object.(client.Object).GetName() != "w3" {
+			t.Errorf("expected ADDED w3, got %s %s", evt.Type, evt.Object.(client.Object).GetName())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for live event")
+	}
+}
+
+type BadList struct {
+	storectrl.BaseList `json:",inline"`
+}
+
+func (b *BadList) DeepCopyObject() runtime.Object {
+	if b == nil {
+		return nil
+	}
+	out := &BadList{}
+	b.BaseList.DeepCopyInto(&out.BaseList)
+	return out
+}
+
+func TestStoreListerWatcherSendInitialEventsBadList(t *testing.T) {
+	ctx := context.Background()
+	badGV := schema.GroupVersion{Group: "bad.storectrl.dev", Version: "v1"}
+	scheme := runtime.NewScheme()
+	scheme.AddKnownTypes(badGV, &BadList{})
+	metav1.AddToGroupVersion(scheme, badGV)
+
+	store := memory.NewStore(scheme)
+	slw := storectrl.NewStoreListerWatcher(store, &BadList{})
+
+	sendInitial := true
+	_, err := slw.WatchWithContext(ctx, metav1.ListOptions{
+		SendInitialEvents: &sendInitial,
+	})
+	if err == nil {
+		t.Fatal("expected error for list type without Items field")
+	}
+	if !strings.Contains(err.Error(), "Items") {
+		t.Errorf("expected error about Items field, got: %v", err)
+	}
+}
+
+func TestStoreListerWatcherSendInitialEventsEmpty(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme()
+	store := memory.NewStore(scheme)
+
+	slw := storectrl.NewStoreListerWatcher(store, &WidgetList{})
+
+	sendInitial := true
+	watcher, err := slw.WatchWithContext(ctx, metav1.ListOptions{
+		SendInitialEvents: &sendInitial,
+	})
+	if err != nil {
+		t.Fatalf("watch: %v", err)
+	}
+	defer watcher.Stop()
+
+	// Empty store: should get BOOKMARK immediately
+	select {
+	case evt := <-watcher.ResultChan():
+		if evt.Type != watch.Bookmark {
+			t.Fatalf("expected BOOKMARK on empty store, got %s", evt.Type)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for bookmark on empty store")
+	}
+}
+
+func TestStoreListerWatcherInvalidLabelSelector(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme()
+	store := memory.NewStore(scheme)
+	slw := storectrl.NewStoreListerWatcher(store, &WidgetList{})
+
+	t.Run("WatchWithContext", func(t *testing.T) {
+		_, err := slw.WatchWithContext(ctx, metav1.ListOptions{
+			LabelSelector: "!!invalid!!",
+		})
+		if err == nil {
+			t.Fatal("expected error for invalid label selector")
+		}
+	})
+
+	t.Run("SendInitialEvents", func(t *testing.T) {
+		sendInitial := true
+		_, err := slw.WatchWithContext(ctx, metav1.ListOptions{
+			LabelSelector:     "!!invalid!!",
+			SendInitialEvents: &sendInitial,
+		})
+		if err == nil {
+			t.Fatal("expected error for invalid label selector with SendInitialEvents")
+		}
+	})
 }

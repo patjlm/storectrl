@@ -64,11 +64,9 @@ Thin adapter that wraps a Store into client-go's `ListerWatcher` interface. This
 - **Partial ListOptions translation** — only `LabelSelector` and `ResourceVersion` are translated from `metav1.ListOptions`. Pagination, field selectors, and timeouts are silently ignored (CR's Reflector handles this gracefully).
 - **Higher K8s coupling** — you depend on CR's internal informer implementation.
 
-**Known limitation:** client-go v0.36+ uses `watchList` by default in its Reflector, which requires the backend to send bookmark events to signal end of initial events. StoreListerWatcher does not currently send bookmarks, so `SharedIndexInformer` may take 10+ seconds to sync (it falls back to traditional List+Watch after a timeout). This needs a fix in the adapter.
+**Honest take:** Couples you to CR internals, and the compatibility surface is fragile. The dummy `rest.Config` is a hack. Use when you genuinely need per-namespace informers or DeltaFIFO, or want automatic CR feature parity without maintaining storectrl's cache.
 
-**Honest take:** Couples you to CR internals, and the compatibility surface is fragile — the watchList issue above is an example. The dummy `rest.Config` is a hack. Use when you genuinely need per-namespace informers or DeltaFIFO, or want automatic CR feature parity without maintaining storectrl's cache.
-
-**See:** [`TestWiringStoreListerWatcher`](../wiring_test.go) for a runnable example.
+**See:** [`TestWiringStoreListerWatcher` and `TestWiringStoreListerWatcherWithInformer`](../wiring_test.go) for runnable examples.
 
 ## Compositions
 

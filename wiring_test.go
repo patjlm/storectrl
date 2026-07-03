@@ -8,6 +8,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	toolscache "k8s.io/client-go/tools/cache"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -263,9 +264,54 @@ func TestWiringStoreListerWatcher(t *testing.T) {
 	}
 }
 
-// NOTE: StoreListerWatcher + SharedIndexInformer is not tested here because
-// client-go v0.36+ uses watchList by default, which requires the backend to
-// send bookmark events to signal end of initial events. StoreListerWatcher
-// does not currently implement this. The adapter works for direct List/Watch
-// usage (see TestWiringStoreListerWatcher) but needs updates for full
-// SharedIndexInformer compatibility with newer client-go versions.
+// TestWiringStoreListerWatcherWithInformer demonstrates StoreListerWatcher
+// with SharedIndexInformer. client-go v0.36+ defaults to watchList mode,
+// which requires BOOKMARK events to signal end of initial events.
+// StoreListerWatcher handles this via the SendInitialEvents protocol.
+func TestWiringStoreListerWatcherWithInformer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store, _ := newTestStore()
+
+	w1 := newWidget("w1", "blue", 10)
+	w2 := newWidget("w2", "red", 20)
+	if err := store.Create(ctx, w1); err != nil {
+		t.Fatalf("create w1: %v", err)
+	}
+	if err := store.Create(ctx, w2); err != nil {
+		t.Fatalf("create w2: %v", err)
+	}
+
+	slw := storectrl.NewStoreListerWatcher(store, &WidgetList{})
+	informer := toolscache.NewSharedIndexInformer(slw, &Widget{}, 0, toolscache.Indexers{})
+
+	go informer.Run(ctx.Done())
+
+	syncCtx, syncCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer syncCancel()
+	if !toolscache.WaitForCacheSync(syncCtx.Done(), informer.HasSynced) {
+		t.Fatal("informer never synced — bookmark event likely missing")
+	}
+
+	items := informer.GetStore().List()
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items in informer store, got %d", len(items))
+	}
+
+	w3 := newWidget("w3", "green", 30)
+	if err := store.Create(ctx, w3); err != nil {
+		t.Fatalf("create w3: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(informer.GetStore().List()) == 3 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if len(informer.GetStore().List()) != 3 {
+		t.Fatal("informer did not pick up live event after initial sync")
+	}
+}
