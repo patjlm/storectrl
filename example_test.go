@@ -3,6 +3,8 @@ package storectrl_test
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,8 +12,11 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	toolscache "k8s.io/client-go/tools/cache"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -809,5 +814,700 @@ func TestCacheFieldIndex(t *testing.T) {
 	}
 	if len(purples.Items) != 0 {
 		t.Errorf("expected 0 purple widgets, got %d", len(purples.Items))
+	}
+}
+
+func TestClientPatch(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme()
+	store := memory.NewStore(scheme)
+	c := storectrl.NewClient(store, scheme)
+
+	widget := newWidget("patch-widget", "blue", 10)
+	if err := c.Create(ctx, widget); err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+
+	base := widget.DeepCopyObject().(client.Object)
+	widget.Spec.Color = "green"
+	if err := c.Patch(ctx, widget, client.MergeFrom(base)); err != nil {
+		t.Fatalf("merge patch failed: %v", err)
+	}
+	got := &Widget{}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(widget), got); err != nil {
+		t.Fatalf("get after merge patch: %v", err)
+	}
+	if got.Spec.Color != "green" {
+		t.Errorf("expected color=green after merge patch, got %s", got.Spec.Color)
+	}
+	if got.Spec.Size != 10 {
+		t.Errorf("expected size=10 preserved after merge patch, got %d", got.Spec.Size)
+	}
+
+	jsonPatch := `[{"op":"replace","path":"/spec/size","value":99}]`
+	if err := c.Patch(ctx, widget, client.RawPatch(types.JSONPatchType, []byte(jsonPatch))); err != nil {
+		t.Fatalf("json patch failed: %v", err)
+	}
+	got = &Widget{}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(widget), got); err != nil {
+		t.Fatalf("get after json patch: %v", err)
+	}
+	if got.Spec.Size != 99 {
+		t.Errorf("expected size=99 after json patch, got %d", got.Spec.Size)
+	}
+
+	err := c.Patch(ctx, widget, client.RawPatch(types.ApplyPatchType, []byte("{}")))
+	if err == nil || !strings.Contains(err.Error(), "unsupported patch type") {
+		t.Errorf("expected error containing 'unsupported patch type', got: %v", err)
+	}
+
+	ghost := newWidget("ghost", "purple", 1)
+	err = c.Patch(ctx, ghost, client.RawPatch(types.MergePatchType, []byte(`{"spec":{"color":"yellow"}}`)))
+	if !errors.IsNotFound(err) {
+		t.Errorf("expected NotFound for nonexistent patch, got: %v", err)
+	}
+}
+
+func TestCacheRelistRecovery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	scheme := testScheme()
+	store := memory.NewStore(scheme, memory.WithEventLogSize(5))
+	c := storectrl.NewCache(store, scheme)
+
+	if _, err := c.GetInformer(ctx, &Widget{}); err != nil {
+		t.Fatalf("get informer: %v", err)
+	}
+
+	go func() { _ = c.Start(ctx) }()
+	if !c.WaitForCacheSync(ctx) {
+		t.Fatal("cache never synced")
+	}
+
+	w1 := newWidget("w1", "blue", 1)
+	if err := store.Create(ctx, w1); err != nil {
+		t.Fatalf("create w1: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		got := &Widget{}
+		if err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "w1"}, got); err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "w1"}, &Widget{}); err != nil {
+		t.Fatalf("cache never saw w1: %v", err)
+	}
+
+	for i := 2; i <= 11; i++ {
+		w := newWidget(fmt.Sprintf("w%d", i), "red", i)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create w%d: %v", i, err)
+		}
+	}
+
+	deadline = time.Now().Add(5 * time.Second)
+	var list *WidgetList
+	for time.Now().Before(deadline) {
+		list = &WidgetList{}
+		if err := c.List(ctx, list); err == nil && len(list.Items) == 11 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if list == nil || len(list.Items) != 11 {
+		count := 0
+		if list != nil {
+			count = len(list.Items)
+		}
+		t.Fatalf("expected 11 widgets in cache after relist recovery, got %d", count)
+	}
+
+	got := &Widget{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "w7"}, got); err != nil {
+		t.Fatalf("get w7 from cache: %v", err)
+	}
+	if got.Spec.Color != "red" || got.Spec.Size != 7 {
+		t.Errorf("wrong w7 spec: color=%s size=%d", got.Spec.Color, got.Spec.Size)
+	}
+}
+
+func TestCacheWithDefaultTransform(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	scheme := testScheme()
+	store := memory.NewStore(scheme)
+
+	// Transform that zeroes Size field
+	c := storectrl.NewCache(store, scheme,
+		storectrl.WithDefaultTransform(func(in any) (any, error) {
+			if w, ok := in.(*Widget); ok {
+				w.Spec.Size = 0
+			}
+			return in, nil
+		}),
+	)
+
+	if _, err := c.GetInformer(ctx, &Widget{}); err != nil {
+		t.Fatalf("get informer: %v", err)
+	}
+
+	go func() { _ = c.Start(ctx) }()
+	if !c.WaitForCacheSync(ctx) {
+		t.Fatal("cache never synced")
+	}
+
+	w := newWidget("w1", "blue", 42)
+	if err := store.Create(ctx, w); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	got := &Widget{}
+	for time.Now().Before(deadline) {
+		if err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "w1"}, got); err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if got.Spec.Size != 0 {
+		t.Errorf("expected size=0 after transform, got %d", got.Spec.Size)
+	}
+	if got.Spec.Color != "blue" {
+		t.Errorf("expected color=blue preserved, got %s", got.Spec.Color)
+	}
+}
+
+func TestCacheWithTransformStripManagedFields(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	scheme := testScheme()
+	store := memory.NewStore(scheme)
+	c := storectrl.NewCache(store, scheme,
+		storectrl.WithDefaultTransform(storectrl.TransformStripManagedFields()),
+	)
+
+	if _, err := c.GetInformer(ctx, &Widget{}); err != nil {
+		t.Fatalf("get informer: %v", err)
+	}
+
+	go func() { _ = c.Start(ctx) }()
+	if !c.WaitForCacheSync(ctx) {
+		t.Fatal("cache never synced")
+	}
+
+	w := newWidget("w1", "blue", 1)
+	w.ManagedFields = []metav1.ManagedFieldsEntry{
+		{Manager: "test", Operation: metav1.ManagedFieldsOperationApply},
+	}
+	if err := store.Create(ctx, w); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	got := &Widget{}
+	for time.Now().Before(deadline) {
+		if err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "w1"}, got); err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if got.ManagedFields != nil {
+		t.Errorf("expected managedFields stripped, got %v", got.ManagedFields)
+	}
+}
+
+func TestCacheWithUnsafeDisableDeepCopy(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	scheme := testScheme()
+	store := memory.NewStore(scheme)
+	c := storectrl.NewCache(store, scheme,
+		storectrl.WithDefaultUnsafeDisableDeepCopy(true),
+	)
+
+	if _, err := c.GetInformer(ctx, &Widget{}); err != nil {
+		t.Fatalf("get informer: %v", err)
+	}
+
+	go func() { _ = c.Start(ctx) }()
+	if !c.WaitForCacheSync(ctx) {
+		t.Fatal("cache never synced")
+	}
+
+	w := newWidget("w1", "blue", 10)
+	if err := store.Create(ctx, w); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	got1 := &Widget{}
+	for time.Now().Before(deadline) {
+		if err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "w1"}, got1); err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	got2 := &Widget{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "w1"}, got2); err != nil {
+		t.Fatalf("get2: %v", err)
+	}
+
+	// With UnsafeDisableDeepCopy, both should reference same underlying data
+	// Mutating got1 should affect got2 on next read
+	if got1.Spec.Color != "blue" {
+		t.Errorf("expected blue, got %s", got1.Spec.Color)
+	}
+
+	// List should also return without deep copy
+	list := &WidgetList{}
+	if err := c.List(ctx, list); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list.Items) != 1 {
+		t.Fatalf("expected 1 widget, got %d", len(list.Items))
+	}
+}
+
+func TestCacheWithLabelSelector(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	scheme := testScheme()
+	store := memory.NewStore(scheme)
+
+	sel := labels.SelectorFromSet(labels.Set{"env": "prod"})
+	c := storectrl.NewCache(store, scheme,
+		storectrl.WithDefaultLabelSelector(sel),
+	)
+
+	if _, err := c.GetInformer(ctx, &Widget{}); err != nil {
+		t.Fatalf("get informer: %v", err)
+	}
+
+	go func() { _ = c.Start(ctx) }()
+	if !c.WaitForCacheSync(ctx) {
+		t.Fatal("cache never synced")
+	}
+
+	// Create widget with matching label
+	wProd := newWidget("w-prod", "blue", 1)
+	wProd.Labels = map[string]string{"env": "prod"}
+	if err := store.Create(ctx, wProd); err != nil {
+		t.Fatalf("create prod: %v", err)
+	}
+
+	// Create widget without matching label
+	wDev := newWidget("w-dev", "red", 2)
+	wDev.Labels = map[string]string{"env": "dev"}
+	if err := store.Create(ctx, wDev); err != nil {
+		t.Fatalf("create dev: %v", err)
+	}
+
+	// Wait for cache to process events
+	deadline := time.Now().Add(2 * time.Second)
+	var list *WidgetList
+	for time.Now().Before(deadline) {
+		list = &WidgetList{}
+		if err := c.List(ctx, list); err == nil && len(list.Items) >= 1 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Only prod widget should be cached
+	if len(list.Items) != 1 {
+		t.Fatalf("expected 1 widget (prod only), got %d", len(list.Items))
+	}
+	if list.Items[0].Name != "w-prod" {
+		t.Errorf("expected w-prod, got %s", list.Items[0].Name)
+	}
+
+	// Dev widget should not be found
+	err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "w-dev"}, &Widget{})
+	if !errors.IsNotFound(err) {
+		t.Errorf("expected NotFound for w-dev, got: %v", err)
+	}
+}
+
+func TestCacheWithByObject(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	scheme := testScheme()
+	store := memory.NewStore(scheme)
+
+	// Default transform zeroes size, but per-object transform for Widget zeroes color
+	c := storectrl.NewCache(store, scheme,
+		storectrl.WithDefaultTransform(func(in any) (any, error) {
+			if w, ok := in.(*Widget); ok {
+				w.Spec.Size = 0
+			}
+			return in, nil
+		}),
+		storectrl.WithByObject(&Widget{}, storectrl.ByObjectConfig{
+			Transform: func(in any) (any, error) {
+				if w, ok := in.(*Widget); ok {
+					w.Spec.Color = ""
+				}
+				return in, nil
+			},
+		}),
+	)
+
+	if _, err := c.GetInformer(ctx, &Widget{}); err != nil {
+		t.Fatalf("get informer: %v", err)
+	}
+
+	go func() { _ = c.Start(ctx) }()
+	if !c.WaitForCacheSync(ctx) {
+		t.Fatal("cache never synced")
+	}
+
+	w := newWidget("w1", "blue", 42)
+	if err := store.Create(ctx, w); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	got := &Widget{}
+	for time.Now().Before(deadline) {
+		if err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "w1"}, got); err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Per-object transform should have zeroed color, NOT size
+	if got.Spec.Color != "" {
+		t.Errorf("expected empty color from per-object transform, got %s", got.Spec.Color)
+	}
+	if got.Spec.Size != 42 {
+		t.Errorf("expected size=42 preserved (default transform overridden), got %d", got.Spec.Size)
+	}
+}
+
+func TestCacheReaderFailOnMissingInformer(t *testing.T) {
+	scheme := testScheme()
+	store := memory.NewStore(scheme)
+
+	t.Run("default behavior fails on missing", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		c := storectrl.NewCache(store, scheme)
+		go func() { _ = c.Start(ctx) }()
+
+		err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "w1"}, &Widget{})
+		if err == nil {
+			t.Fatal("expected error for unregistered type")
+		}
+		if !strings.Contains(err.Error(), "no informer registered") {
+			t.Errorf("expected 'no informer registered' error, got: %v", err)
+		}
+	})
+
+	t.Run("auto-create when disabled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		c := storectrl.NewCache(store, scheme,
+			storectrl.WithReaderFailOnMissingInformer(false),
+		)
+		go func() { _ = c.Start(ctx) }()
+		time.Sleep(50 * time.Millisecond)
+
+		w := newWidget("auto-w1", "green", 5)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+
+		// Get should auto-create informer and eventually find the object
+		deadline := time.Now().Add(2 * time.Second)
+		got := &Widget{}
+		var lastErr error
+		for time.Now().Before(deadline) {
+			lastErr = c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "auto-w1"}, got)
+			if lastErr == nil {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if lastErr != nil {
+			t.Fatalf("expected auto-created informer to find object, got: %v", lastErr)
+		}
+		if got.Spec.Color != "green" {
+			t.Errorf("expected green, got %s", got.Spec.Color)
+		}
+	})
+}
+
+func TestCacheSyncPeriod(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	scheme := testScheme()
+	store := memory.NewStore(scheme)
+	c := storectrl.NewCache(store, scheme,
+		storectrl.WithSyncPeriod(100*time.Millisecond),
+	)
+
+	informer, err := c.GetInformer(ctx, &Widget{})
+	if err != nil {
+		t.Fatalf("get informer: %v", err)
+	}
+
+	go func() { _ = c.Start(ctx) }()
+	if !c.WaitForCacheSync(ctx) {
+		t.Fatal("cache never synced")
+	}
+
+	w := newWidget("w1", "blue", 1)
+	if err := store.Create(ctx, w); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Wait for cache to see the object
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "w1"}, &Widget{}); err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Register an event handler and count update events
+	var updateCount atomic.Int32
+	_, err = informer.AddEventHandler(toolscache.ResourceEventHandlerFuncs{
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			updateCount.Add(1)
+		},
+	})
+	if err != nil {
+		t.Fatalf("add event handler: %v", err)
+	}
+
+	// Wait for at least 2 sync period ticks to fire synthetic updates
+	time.Sleep(350 * time.Millisecond)
+
+	count := updateCount.Load()
+	if count < 2 {
+		t.Errorf("expected at least 2 sync period updates, got %d", count)
+	}
+}
+
+func TestCacheUpdateRemovesOnSelectorMismatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	scheme := testScheme()
+	store := memory.NewStore(scheme)
+
+	sel := labels.SelectorFromSet(labels.Set{"env": "prod"})
+	c := storectrl.NewCache(store, scheme,
+		storectrl.WithDefaultLabelSelector(sel),
+	)
+
+	if _, err := c.GetInformer(ctx, &Widget{}); err != nil {
+		t.Fatalf("get informer: %v", err)
+	}
+
+	go func() { _ = c.Start(ctx) }()
+	if !c.WaitForCacheSync(ctx) {
+		t.Fatal("cache never synced")
+	}
+
+	// Create widget with matching label
+	w := newWidget("w1", "blue", 1)
+	w.Labels = map[string]string{"env": "prod"}
+	if err := store.Create(ctx, w); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Wait for cache
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "w1"}, &Widget{}); err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Update label to no longer match selector
+	w.Labels = map[string]string{"env": "dev"}
+	if err := store.Update(ctx, w); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	// Wait for cache to reflect removal
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if errors.IsNotFound(c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "w1"}, &Widget{})) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if !errors.IsNotFound(c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "w1"}, &Widget{})) {
+		t.Error("expected widget removed from cache after label mismatch")
+	}
+}
+
+func TestCacheWithDefaultNamespaces(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	scheme := testScheme()
+	store := memory.NewStore(scheme)
+
+	c := storectrl.NewCache(store, scheme,
+		storectrl.WithDefaultNamespaces([]string{"prod", "staging"}),
+	)
+
+	if _, err := c.GetInformer(ctx, &Widget{}); err != nil {
+		t.Fatalf("get informer: %v", err)
+	}
+
+	go func() { _ = c.Start(ctx) }()
+	if !c.WaitForCacheSync(ctx) {
+		t.Fatal("cache never synced")
+	}
+
+	// Create widgets in different namespaces
+	wProd := newWidget("w-prod", "blue", 1)
+	wProd.Namespace = "prod"
+	if err := store.Create(ctx, wProd); err != nil {
+		t.Fatalf("create prod: %v", err)
+	}
+
+	wStaging := newWidget("w-staging", "green", 2)
+	wStaging.Namespace = "staging"
+	if err := store.Create(ctx, wStaging); err != nil {
+		t.Fatalf("create staging: %v", err)
+	}
+
+	wDev := newWidget("w-dev", "red", 3)
+	wDev.Namespace = "dev"
+	if err := store.Create(ctx, wDev); err != nil {
+		t.Fatalf("create dev: %v", err)
+	}
+
+	// Wait for cache to process events
+	deadline := time.Now().Add(2 * time.Second)
+	var list *WidgetList
+	for time.Now().Before(deadline) {
+		list = &WidgetList{}
+		if err := c.List(ctx, list); err == nil && len(list.Items) >= 2 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Only prod and staging should be cached
+	if len(list.Items) != 2 {
+		t.Fatalf("expected 2 widgets (prod+staging), got %d", len(list.Items))
+	}
+
+	// Dev widget should not be found
+	err := c.Get(ctx, client.ObjectKey{Namespace: "dev", Name: "w-dev"}, &Widget{})
+	if !errors.IsNotFound(err) {
+		t.Errorf("expected NotFound for dev namespace widget, got: %v", err)
+	}
+}
+
+func TestCacheWithDefaultNamespacesAllNamespaces(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	scheme := testScheme()
+	store := memory.NewStore(scheme)
+
+	// AllNamespaces catches everything not explicitly listed
+	c := storectrl.NewCache(store, scheme,
+		storectrl.WithDefaultNamespaces([]string{"prod", storectrl.AllNamespaces}),
+	)
+
+	if _, err := c.GetInformer(ctx, &Widget{}); err != nil {
+		t.Fatalf("get informer: %v", err)
+	}
+
+	go func() { _ = c.Start(ctx) }()
+	if !c.WaitForCacheSync(ctx) {
+		t.Fatal("cache never synced")
+	}
+
+	wProd := newWidget("w-prod", "blue", 1)
+	wProd.Namespace = "prod"
+	if err := store.Create(ctx, wProd); err != nil {
+		t.Fatalf("create prod: %v", err)
+	}
+
+	wDev := newWidget("w-dev", "red", 2)
+	wDev.Namespace = "dev"
+	if err := store.Create(ctx, wDev); err != nil {
+		t.Fatalf("create dev: %v", err)
+	}
+
+	// Both should be cached — AllNamespaces covers dev
+	deadline := time.Now().Add(2 * time.Second)
+	var list *WidgetList
+	for time.Now().Before(deadline) {
+		list = &WidgetList{}
+		if err := c.List(ctx, list); err == nil && len(list.Items) >= 2 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if len(list.Items) != 2 {
+		t.Fatalf("expected 2 widgets (AllNamespaces includes all), got %d", len(list.Items))
+	}
+}
+
+func TestCacheWithEnableWatchBookmarks(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	scheme := testScheme()
+	store := memory.NewStore(scheme)
+
+	// Verify EnableWatchBookmarks is accepted and passed through
+	c := storectrl.NewCache(store, scheme,
+		storectrl.WithDefaultEnableWatchBookmarks(true),
+	)
+
+	if _, err := c.GetInformer(ctx, &Widget{}); err != nil {
+		t.Fatalf("get informer: %v", err)
+	}
+
+	go func() { _ = c.Start(ctx) }()
+	if !c.WaitForCacheSync(ctx) {
+		t.Fatal("cache never synced")
+	}
+
+	// Cache should work normally with bookmarks enabled
+	w := newWidget("w1", "blue", 1)
+	if err := store.Create(ctx, w); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	got := &Widget{}
+	for time.Now().Before(deadline) {
+		if err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "w1"}, got); err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got.Spec.Color != "blue" {
+		t.Errorf("expected blue, got %s", got.Spec.Color)
 	}
 }

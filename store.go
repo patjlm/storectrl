@@ -15,6 +15,15 @@ type WatchFromRevision int64
 
 func (w WatchFromRevision) ApplyToList(_ *client.ListOptions) {}
 
+// EnableWatchBookmarks is a client.ListOption that requests the backend to
+// send periodic BOOKMARK events during Watch. Backends that support bookmarks
+// honor this; others may ignore it. Bookmarks carry no object data — just a
+// resourceVersion — and help the cache track progress to avoid full relists
+// on reconnection.
+type EnableWatchBookmarks bool
+
+func (e EnableWatchBookmarks) ApplyToList(_ *client.ListOptions) {}
+
 // Store is the interface backend implementations must satisfy.
 // It abstracts the data persistence layer so controllers can work
 // against any datastore (SQL, GCP APIs, in-memory, etc.) instead of

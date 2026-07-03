@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"sync"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -20,6 +22,147 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 )
 
+// CacheOption configures the cache. Use With* functions to create options.
+type CacheOption func(*cacheOptions)
+
+type cacheOptions struct {
+	defaultTransform             toolscache.TransformFunc
+	defaultUnsafeDisableDeepCopy bool
+	defaultLabelSelector         labels.Selector
+	defaultFieldSelector         fields.Selector
+	defaultEnableWatchBookmarks  *bool
+	defaultNamespaces            map[string]struct{}
+	byObject                     []byObjectEntry
+	readerFailOnMissingInformer  bool
+	syncPeriod                   *time.Duration
+}
+
+type byObjectEntry struct {
+	obj    client.Object
+	config ByObjectConfig
+}
+
+// ByObjectConfig configures the cache for a specific object type,
+// overriding any default settings.
+type ByObjectConfig struct {
+	Transform             toolscache.TransformFunc
+	UnsafeDisableDeepCopy *bool
+	Label                 labels.Selector
+	Field                 fields.Selector
+	EnableWatchBookmarks  *bool
+}
+
+// informerConfig holds the resolved per-GVK configuration for an informer.
+type informerConfig struct {
+	transform             toolscache.TransformFunc
+	unsafeDisableDeepCopy bool
+	labelSelector         labels.Selector
+	fieldSelector         fields.Selector
+	enableWatchBookmarks  *bool
+	namespaces            map[string]struct{}
+	syncPeriod            *time.Duration
+}
+
+// WithDefaultTransform sets the default transform function applied to objects
+// before they are cached. Per-object transforms override this.
+func WithDefaultTransform(fn toolscache.TransformFunc) CacheOption {
+	return func(o *cacheOptions) {
+		o.defaultTransform = fn
+	}
+}
+
+// WithDefaultUnsafeDisableDeepCopy disables deep copying of cached objects
+// on read when set to true. This improves performance but callers must not
+// mutate returned objects. Per-object settings override this.
+func WithDefaultUnsafeDisableDeepCopy(disable bool) CacheOption {
+	return func(o *cacheOptions) {
+		o.defaultUnsafeDisableDeepCopy = disable
+	}
+}
+
+// WithDefaultLabelSelector sets a default label selector that filters which
+// objects are cached. Per-object selectors override this.
+func WithDefaultLabelSelector(sel labels.Selector) CacheOption {
+	return func(o *cacheOptions) {
+		o.defaultLabelSelector = sel
+	}
+}
+
+// WithDefaultFieldSelector sets a default field selector that filters which
+// objects are cached. Per-object selectors override this.
+func WithDefaultFieldSelector(sel fields.Selector) CacheOption {
+	return func(o *cacheOptions) {
+		o.defaultFieldSelector = sel
+	}
+}
+
+// WithByObject configures the cache for a specific object type, overriding
+// any default settings for transform, deep copy, and selectors.
+func WithByObject(obj client.Object, config ByObjectConfig) CacheOption {
+	return func(o *cacheOptions) {
+		o.byObject = append(o.byObject, byObjectEntry{obj: obj, config: config})
+	}
+}
+
+// WithReaderFailOnMissingInformer controls whether Get/List return an error
+// when no informer exists for the requested type. When true (the default),
+// callers must register informers explicitly via GetInformer. When false,
+// informers are auto-created on demand, matching controller-runtime behavior.
+func WithReaderFailOnMissingInformer(fail bool) CacheOption {
+	return func(o *cacheOptions) {
+		o.readerFailOnMissingInformer = fail
+	}
+}
+
+// WithSyncPeriod sets the interval at which the cache re-delivers all cached
+// objects to event handlers as update events. This matches controller-runtime's
+// resync behavior. A zero or negative duration disables periodic resync.
+func WithSyncPeriod(d time.Duration) CacheOption {
+	return func(o *cacheOptions) {
+		o.syncPeriod = &d
+	}
+}
+
+// WithDefaultEnableWatchBookmarks requests backends to send periodic BOOKMARK
+// events during Watch. Backends that support bookmarks honor this; others may
+// ignore it. Defaults to true when not set, matching controller-runtime behavior.
+// Per-object settings in ByObjectConfig override this.
+func WithDefaultEnableWatchBookmarks(enable bool) CacheOption {
+	return func(o *cacheOptions) {
+		o.defaultEnableWatchBookmarks = &enable
+	}
+}
+
+// WithDefaultNamespaces restricts the cache to objects from the specified
+// namespaces. This is a simplified version of controller-runtime's
+// DefaultNamespaces map[string]cache.Config — only namespace filtering is
+// supported, not per-namespace configuration (selectors, transforms).
+// Use the AllNamespaces constant (empty string) to include all namespaces
+// not explicitly listed. Use WithByObject for per-type configuration.
+func WithDefaultNamespaces(namespaces []string) CacheOption {
+	return func(o *cacheOptions) {
+		o.defaultNamespaces = make(map[string]struct{}, len(namespaces))
+		for _, ns := range namespaces {
+			o.defaultNamespaces[ns] = struct{}{}
+		}
+	}
+}
+
+// AllNamespaces is the key used in WithDefaultNamespaces to indicate all
+// namespaces not explicitly listed should be cached.
+const AllNamespaces = ""
+
+// TransformStripManagedFields returns a transform that strips managed fields
+// from objects before caching, reducing memory usage.
+func TransformStripManagedFields() toolscache.TransformFunc {
+	return func(in any) (any, error) {
+		if obj, ok := in.(client.Object); ok && obj.GetManagedFields() != nil {
+			obj.SetManagedFields(nil)
+		}
+		return in, nil
+	}
+}
+
 // storeCache implements cache.Cache backed by a Store.
 type storeCache struct {
 	store  Store
@@ -28,16 +171,79 @@ type storeCache struct {
 	mu        sync.RWMutex
 	informers map[schema.GroupVersionKind]*storeInformer
 	started   bool
+	startCtx  context.Context
 	synced    map[schema.GroupVersionKind]bool
+
+	opts            cacheOptions
+	informerConfigs map[schema.GroupVersionKind]informerConfig
 }
 
 // NewCache creates a new cache.Cache backed by the given Store.
-func NewCache(store Store, scheme *runtime.Scheme) cache.Cache {
+func NewCache(store Store, scheme *runtime.Scheme, opts ...CacheOption) cache.Cache {
+	options := cacheOptions{
+		readerFailOnMissingInformer: true,
+	}
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	configs := make(map[schema.GroupVersionKind]informerConfig)
+	for _, entry := range options.byObject {
+		gvk, err := apiutil.GVKForObject(entry.obj, scheme)
+		if err != nil {
+			continue
+		}
+		cfg := informerConfig{
+			transform:     entry.config.Transform,
+			labelSelector: entry.config.Label,
+			fieldSelector: entry.config.Field,
+			namespaces:    options.defaultNamespaces,
+			syncPeriod:    options.syncPeriod,
+		}
+		if entry.config.UnsafeDisableDeepCopy != nil {
+			cfg.unsafeDisableDeepCopy = *entry.config.UnsafeDisableDeepCopy
+		} else {
+			cfg.unsafeDisableDeepCopy = options.defaultUnsafeDisableDeepCopy
+		}
+		if entry.config.EnableWatchBookmarks != nil {
+			cfg.enableWatchBookmarks = entry.config.EnableWatchBookmarks
+		} else {
+			cfg.enableWatchBookmarks = options.defaultEnableWatchBookmarks
+		}
+		if cfg.transform == nil {
+			cfg.transform = options.defaultTransform
+		}
+		if cfg.labelSelector == nil {
+			cfg.labelSelector = options.defaultLabelSelector
+		}
+		if cfg.fieldSelector == nil {
+			cfg.fieldSelector = options.defaultFieldSelector
+		}
+		configs[gvk] = cfg
+	}
+
 	return &storeCache{
-		store:     store,
-		scheme:    scheme,
-		informers: make(map[schema.GroupVersionKind]*storeInformer),
-		synced:    make(map[schema.GroupVersionKind]bool),
+		store:           store,
+		scheme:          scheme,
+		informers:       make(map[schema.GroupVersionKind]*storeInformer),
+		synced:          make(map[schema.GroupVersionKind]bool),
+		opts:            options,
+		informerConfigs: configs,
+	}
+}
+
+func (c *storeCache) resolveConfig(gvk schema.GroupVersionKind) informerConfig {
+	if cfg, ok := c.informerConfigs[gvk]; ok {
+		return cfg
+	}
+	return informerConfig{
+		transform:             c.opts.defaultTransform,
+		unsafeDisableDeepCopy: c.opts.defaultUnsafeDisableDeepCopy,
+		labelSelector:         c.opts.defaultLabelSelector,
+		fieldSelector:         c.opts.defaultFieldSelector,
+		enableWatchBookmarks:  c.opts.defaultEnableWatchBookmarks,
+		namespaces:            c.opts.defaultNamespaces,
+		syncPeriod:            c.opts.syncPeriod,
 	}
 }
 
@@ -53,7 +259,13 @@ func (c *storeCache) Get(ctx context.Context, key client.ObjectKey, obj client.O
 	c.mu.RUnlock()
 
 	if !exists {
-		return fmt.Errorf("no informer registered for %v", gvk)
+		if c.opts.readerFailOnMissingInformer {
+			return fmt.Errorf("no informer registered for %v; set up an informer via GetInformer or disable ReaderFailOnMissingInformer", gvk)
+		}
+		informer, err = c.getOrCreateInformer(gvk, obj)
+		if err != nil {
+			return err
+		}
 	}
 
 	return informer.get(key, obj)
@@ -75,7 +287,21 @@ func (c *storeCache) List(ctx context.Context, list client.ObjectList, opts ...c
 	c.mu.RUnlock()
 
 	if !exists {
-		return fmt.Errorf("no informer registered for %v", gvk)
+		if c.opts.readerFailOnMissingInformer {
+			return fmt.Errorf("no informer registered for %v; set up an informer via GetInformer or disable ReaderFailOnMissingInformer", gvk)
+		}
+		runtimeObj, schemeErr := c.scheme.New(gvk)
+		if schemeErr != nil {
+			return schemeErr
+		}
+		clientObj, ok := runtimeObj.(client.Object)
+		if !ok {
+			return fmt.Errorf("object for %v does not implement client.Object", gvk)
+		}
+		informer, err = c.getOrCreateInformer(gvk, clientObj)
+		if err != nil {
+			return err
+		}
 	}
 
 	return informer.list(list, opts...)
@@ -107,20 +333,33 @@ func (c *storeCache) GetInformerForKind(ctx context.Context, gvk schema.GroupVer
 
 func (c *storeCache) getOrCreateInformer(gvk schema.GroupVersionKind, obj client.Object) (*storeInformer, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	if informer, exists := c.informers[gvk]; exists {
+		c.mu.Unlock()
 		return informer, nil
 	}
 
-	informer := newStoreInformer(gvk, obj, c.scheme)
+	config := c.resolveConfig(gvk)
+	informer := newStoreInformer(gvk, obj, c.scheme, config)
 	c.informers[gvk] = informer
 
-	// If cache is already started, start this informer immediately
-	if c.started {
-		ctx := context.Background() // Use background context for goroutine
-		if err := c.startInformer(ctx, informer); err != nil {
+	needStart := c.started
+	startCtx := c.startCtx
+	c.mu.Unlock()
+
+	if needStart {
+		select {
+		case <-startCtx.Done():
+			c.mu.Lock()
 			delete(c.informers, gvk)
+			c.mu.Unlock()
+			return nil, fmt.Errorf("cache is stopped")
+		default:
+		}
+		if err := c.startInformer(startCtx, informer); err != nil {
+			c.mu.Lock()
+			delete(c.informers, gvk)
+			c.mu.Unlock()
 			return nil, err
 		}
 	}
@@ -155,6 +394,7 @@ func (c *storeCache) Start(ctx context.Context) error {
 		return nil
 	}
 	c.started = true
+	c.startCtx = ctx
 
 	// Get snapshot of informers to start
 	informersToStart := make([]*storeInformer, 0, len(c.informers))
@@ -189,8 +429,17 @@ func (c *storeCache) startInformer(ctx context.Context, informer *storeInformer)
 		return fmt.Errorf("object does not implement client.ObjectList")
 	}
 
+	// Build list options from informer config selectors
+	var listOpts []client.ListOption
+	if informer.config.labelSelector != nil {
+		listOpts = append(listOpts, client.MatchingLabelsSelector{Selector: informer.config.labelSelector})
+	}
+	if informer.config.fieldSelector != nil {
+		listOpts = append(listOpts, client.MatchingFieldsSelector{Selector: informer.config.fieldSelector})
+	}
+
 	// Initial list to populate cache
-	if err := c.store.List(ctx, list); err != nil {
+	if err := c.store.List(ctx, list, listOpts...); err != nil {
 		return err
 	}
 
@@ -229,6 +478,28 @@ func (c *storeCache) startInformer(ctx context.Context, informer *storeInformer)
 
 func (c *storeCache) watchInformer(ctx context.Context, informer *storeInformer, list client.ObjectList, initialRV int64) {
 	lastRV := initialRV
+	backoff := time.Second
+	const maxBackoff = 30 * time.Second
+
+	// Build watch options from informer config selectors
+	var watchOpts []client.ListOption
+	if informer.config.labelSelector != nil {
+		watchOpts = append(watchOpts, client.MatchingLabelsSelector{Selector: informer.config.labelSelector})
+	}
+	if informer.config.fieldSelector != nil {
+		watchOpts = append(watchOpts, client.MatchingFieldsSelector{Selector: informer.config.fieldSelector})
+	}
+	if informer.config.enableWatchBookmarks != nil {
+		watchOpts = append(watchOpts, EnableWatchBookmarks(*informer.config.enableWatchBookmarks))
+	}
+
+	// Setup sync period ticker
+	var syncCh <-chan time.Time
+	if informer.config.syncPeriod != nil && *informer.config.syncPeriod > 0 {
+		ticker := time.NewTicker(*informer.config.syncPeriod)
+		defer ticker.Stop()
+		syncCh = ticker.C
+	}
 
 	for {
 		select {
@@ -237,23 +508,38 @@ func (c *storeCache) watchInformer(ctx context.Context, informer *storeInformer,
 		default:
 		}
 
-		watcher, err := c.store.Watch(ctx, list, WatchFromRevision(lastRV))
+		opts := append([]client.ListOption{WatchFromRevision(lastRV)}, watchOpts...)
+		watcher, err := c.store.Watch(ctx, list, opts...)
 		if err != nil {
 			var rvErr *RevisionTooOldError
 			if errors.As(err, &rvErr) {
 				if err := c.relistInformer(ctx, informer, list); err != nil {
-					return
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(backoff):
+					}
+					backoff = min(backoff*2, maxBackoff)
+					continue
 				}
 				if getter, ok := list.(interface{ GetResourceVersion() string }); ok {
 					lastRV, _ = strconv.ParseInt(getter.GetResourceVersion(), 10, 64)
 				} else {
 					lastRV = 0
 				}
+				backoff = time.Second
 				continue
 			}
-			return
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			backoff = min(backoff*2, maxBackoff)
+			continue
 		}
 
+		backoff = time.Second
 		informer.setWatcher(watcher)
 
 	eventLoop:
@@ -282,6 +568,8 @@ func (c *storeCache) watchInformer(ctx context.Context, informer *storeInformer,
 					informer.delete(event.Object)
 				case EventBookmark:
 				}
+			case <-syncCh:
+				c.resyncInformer(informer)
 			}
 		}
 
@@ -295,8 +583,37 @@ func (c *storeCache) watchInformer(ctx context.Context, informer *storeInformer,
 	}
 }
 
+func (c *storeCache) resyncInformer(informer *storeInformer) {
+	informer.mu.RLock()
+	objects := make([]client.Object, 0, len(informer.objects))
+	for _, obj := range informer.objects {
+		objects = append(objects, obj.DeepCopyObject().(client.Object))
+	}
+	informer.mu.RUnlock()
+
+	informer.handlerMu.RLock()
+	handlers := make([]toolscache.ResourceEventHandler, len(informer.handlers))
+	for idx, h := range informer.handlers {
+		handlers[idx] = h.handler
+	}
+	informer.handlerMu.RUnlock()
+
+	for _, obj := range objects {
+		for _, h := range handlers {
+			h.OnUpdate(obj, obj)
+		}
+	}
+}
+
 func (c *storeCache) relistInformer(ctx context.Context, informer *storeInformer, list client.ObjectList) error {
-	if err := c.store.List(ctx, list); err != nil {
+	var listOpts []client.ListOption
+	if informer.config.labelSelector != nil {
+		listOpts = append(listOpts, client.MatchingLabelsSelector{Selector: informer.config.labelSelector})
+	}
+	if informer.config.fieldSelector != nil {
+		listOpts = append(listOpts, client.MatchingFieldsSelector{Selector: informer.config.fieldSelector})
+	}
+	if err := c.store.List(ctx, list, listOpts...); err != nil {
 		return err
 	}
 	items, err := meta.ExtractList(list)
@@ -321,20 +638,22 @@ func (c *storeCache) WaitForCacheSync(ctx context.Context) bool {
 		case <-ctx.Done():
 			return false
 		default:
-			allSynced := true
-			c.mu.RLock()
-			for _, gvk := range gvks {
-				if !c.synced[gvk] {
-					allSynced = false
-					break
-				}
-			}
-			c.mu.RUnlock()
+		}
 
-			if allSynced {
-				return true
+		allSynced := true
+		c.mu.RLock()
+		for _, gvk := range gvks {
+			if !c.synced[gvk] {
+				allSynced = false
+				break
 			}
 		}
+		c.mu.RUnlock()
+
+		if allSynced {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -374,9 +693,12 @@ type storeInformer struct {
 	handlers  []handlerRegistration
 	nextID    int
 
-	synced  bool
-	stopped bool
-	watcher Watcher
+	synced   bool
+	syncedCh chan struct{}
+	stopped  bool
+	watcher  Watcher
+
+	config informerConfig
 }
 
 type handlerRegistration struct {
@@ -384,7 +706,7 @@ type handlerRegistration struct {
 	handler toolscache.ResourceEventHandler
 }
 
-func newStoreInformer(gvk schema.GroupVersionKind, obj client.Object, scheme *runtime.Scheme) *storeInformer {
+func newStoreInformer(gvk schema.GroupVersionKind, obj client.Object, scheme *runtime.Scheme, config informerConfig) *storeInformer {
 	return &storeInformer{
 		gvk:      gvk,
 		scheme:   scheme,
@@ -392,7 +714,49 @@ func newStoreInformer(gvk schema.GroupVersionKind, obj client.Object, scheme *ru
 		indexers: make(map[string]client.IndexerFunc),
 		indices:  make(map[string]map[string][]client.ObjectKey),
 		handlers: make([]handlerRegistration, 0),
+		syncedCh: make(chan struct{}),
+		config:   config,
 	}
+}
+
+func (i *storeInformer) applyTransform(obj client.Object) (client.Object, error) {
+	if i.config.transform == nil {
+		return obj, nil
+	}
+	result, err := i.config.transform(obj)
+	if err != nil {
+		return nil, err
+	}
+	transformed, ok := result.(client.Object)
+	if !ok {
+		return nil, fmt.Errorf("transform returned %T, expected client.Object", result)
+	}
+	return transformed, nil
+}
+
+func objectToFieldsSet(obj client.Object) fields.Set {
+	return fields.Set{
+		"metadata.name":      obj.GetName(),
+		"metadata.namespace": obj.GetNamespace(),
+	}
+}
+
+func (i *storeInformer) matchesSelectors(obj client.Object) bool {
+	if i.config.namespaces != nil {
+		ns := obj.GetNamespace()
+		_, nsAllowed := i.config.namespaces[ns]
+		_, hasAllNamespaces := i.config.namespaces[AllNamespaces]
+		if !nsAllowed && !hasAllNamespaces {
+			return false
+		}
+	}
+	if i.config.labelSelector != nil && !i.config.labelSelector.Matches(labels.Set(obj.GetLabels())) {
+		return false
+	}
+	if i.config.fieldSelector != nil && !i.config.fieldSelector.Matches(objectToFieldsSet(obj)) {
+		return false
+	}
+	return true
 }
 
 func (i *storeInformer) get(key client.ObjectKey, obj client.Object) error {
@@ -402,6 +766,16 @@ func (i *storeInformer) get(key client.ObjectKey, obj client.Object) error {
 	cached, exists := i.objects[key]
 	if !exists {
 		return &NotFoundError{Key: key.String()}
+	}
+
+	if i.config.unsafeDisableDeepCopy {
+		outVal := reflect.ValueOf(obj)
+		objVal := reflect.ValueOf(cached)
+		if !objVal.Type().AssignableTo(outVal.Type()) {
+			return fmt.Errorf("cache had type %s, but %s was asked for", objVal.Type(), outVal.Type())
+		}
+		reflect.Indirect(outVal).Set(reflect.Indirect(objVal))
+		return nil
 	}
 
 	data, err := json.Marshal(cached)
@@ -461,51 +835,86 @@ func (i *storeInformer) list(list client.ObjectList, opts ...client.ListOption) 
 	// Convert to runtime.Object slice for meta.SetList
 	runtimeItems := make([]runtime.Object, len(items))
 	for idx, item := range items {
-		runtimeItems[idx] = item.DeepCopyObject()
+		if i.config.unsafeDisableDeepCopy {
+			runtimeItems[idx] = item.(runtime.Object)
+		} else {
+			runtimeItems[idx] = item.DeepCopyObject()
+		}
 	}
 
 	return meta.SetList(list, runtimeItems)
 }
 
 func (i *storeInformer) listFromIndex(opts *client.ListOptions) []client.Object {
-	// Try to extract field selector requirements
 	requirements := opts.FieldSelector.Requirements()
+
+	var resultKeys map[client.ObjectKey]struct{}
+	initialized := false
+
 	for _, req := range requirements {
 		if req.Operator != selection.Equals {
 			continue
 		}
 
-		indexName := req.Field
-		indexValue := req.Value
+		index, exists := i.indices[req.Field]
+		if !exists {
+			return nil
+		}
 
-		if index, exists := i.indices[indexName]; exists {
-			if keys, exists := index[indexValue]; exists {
-				items := make([]client.Object, 0, len(keys))
-				for _, key := range keys {
-					if obj, exists := i.objects[key]; exists {
-						items = append(items, obj)
-					}
+		keys, exists := index[req.Value]
+		if !exists {
+			return nil
+		}
+
+		keySet := make(map[client.ObjectKey]struct{}, len(keys))
+		for _, key := range keys {
+			keySet[key] = struct{}{}
+		}
+
+		if !initialized {
+			resultKeys = keySet
+			initialized = true
+		} else {
+			for key := range resultKeys {
+				if _, ok := keySet[key]; !ok {
+					delete(resultKeys, key)
 				}
-				return items
 			}
-			return nil // Index exists but no matching values
 		}
 	}
 
-	// Fall back to full scan if no index matches
-	items := make([]client.Object, 0, len(i.objects))
-	for _, obj := range i.objects {
-		items = append(items, obj)
+	if !initialized {
+		items := make([]client.Object, 0, len(i.objects))
+		for _, obj := range i.objects {
+			items = append(items, obj)
+		}
+		return items
+	}
+
+	items := make([]client.Object, 0, len(resultKeys))
+	for key := range resultKeys {
+		if obj, exists := i.objects[key]; exists {
+			items = append(items, obj)
+		}
 	}
 	return items
 }
 
 func (i *storeInformer) add(obj client.Object) {
-	key := client.ObjectKeyFromObject(obj)
+	if !i.matchesSelectors(obj) {
+		return
+	}
+
+	transformed, err := i.applyTransform(obj)
+	if err != nil {
+		return
+	}
+
+	key := client.ObjectKeyFromObject(transformed)
 
 	i.mu.Lock()
-	i.objects[key] = obj.DeepCopyObject().(client.Object)
-	i.rebuildIndicesForObject(key, obj)
+	i.objects[key] = transformed.DeepCopyObject().(client.Object)
+	i.rebuildIndicesForObject(key, transformed)
 	i.mu.Unlock()
 
 	i.handlerMu.RLock()
@@ -516,17 +925,48 @@ func (i *storeInformer) add(obj client.Object) {
 	i.handlerMu.RUnlock()
 
 	for _, handler := range handlers {
-		handler.OnAdd(obj, false)
+		handler.OnAdd(transformed, false)
 	}
 }
 
 func (i *storeInformer) update(obj client.Object) {
+	matches := i.matchesSelectors(obj)
 	key := client.ObjectKeyFromObject(obj)
 
+	if !matches {
+		// Object no longer matches selectors — remove from cache if present
+		i.mu.Lock()
+		cached, existed := i.objects[key]
+		if existed {
+			delete(i.objects, key)
+			i.removeFromIndices(key)
+		}
+		i.mu.Unlock()
+
+		if existed {
+			i.handlerMu.RLock()
+			handlers := make([]toolscache.ResourceEventHandler, len(i.handlers))
+			for idx, h := range i.handlers {
+				handlers[idx] = h.handler
+			}
+			i.handlerMu.RUnlock()
+
+			for _, handler := range handlers {
+				handler.OnDelete(cached)
+			}
+		}
+		return
+	}
+
+	transformed, err := i.applyTransform(obj)
+	if err != nil {
+		return
+	}
+
 	i.mu.Lock()
-	oldObj := i.objects[key]
-	i.objects[key] = obj.DeepCopyObject().(client.Object)
-	i.rebuildIndicesForObject(key, obj)
+	oldObj, exists := i.objects[key]
+	i.objects[key] = transformed.DeepCopyObject().(client.Object)
+	i.rebuildIndicesForObject(key, transformed)
 	i.mu.Unlock()
 
 	i.handlerMu.RLock()
@@ -536,8 +976,14 @@ func (i *storeInformer) update(obj client.Object) {
 	}
 	i.handlerMu.RUnlock()
 
+	if !exists {
+		for _, handler := range handlers {
+			handler.OnAdd(transformed, false)
+		}
+		return
+	}
 	for _, handler := range handlers {
-		handler.OnUpdate(oldObj, obj)
+		handler.OnUpdate(oldObj, transformed)
 	}
 }
 
@@ -628,8 +1074,15 @@ func (i *storeInformer) replaceAll(items []runtime.Object) {
 		if !ok {
 			continue
 		}
-		key := client.ObjectKeyFromObject(obj)
-		i.objects[key] = obj.DeepCopyObject().(client.Object)
+		if !i.matchesSelectors(obj) {
+			continue
+		}
+		transformed, err := i.applyTransform(obj)
+		if err != nil {
+			continue
+		}
+		key := client.ObjectKeyFromObject(transformed)
+		i.objects[key] = transformed.DeepCopyObject().(client.Object)
 	}
 	for indexName := range i.indices {
 		i.indices[indexName] = make(map[string][]client.ObjectKey)
@@ -649,15 +1102,17 @@ func (i *storeInformer) replaceAll(items []runtime.Object) {
 
 	for key, obj := range oldObjects {
 		if _, exists := newObjects[key]; !exists {
+			objCopy := obj.DeepCopyObject().(client.Object)
 			for _, h := range handlers {
-				h.OnDelete(obj)
+				h.OnDelete(objCopy)
 			}
 		}
 	}
 
 	for _, obj := range newObjects {
+		objCopy := obj.DeepCopyObject().(client.Object)
 		for _, h := range handlers {
-			h.OnAdd(obj, true)
+			h.OnAdd(objCopy, true)
 		}
 	}
 }
@@ -665,7 +1120,10 @@ func (i *storeInformer) replaceAll(items []runtime.Object) {
 func (i *storeInformer) setSynced(synced bool) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	i.synced = synced
+	if synced && !i.synced {
+		i.synced = true
+		close(i.syncedCh)
+	}
 }
 
 func (i *storeInformer) setWatcher(watcher Watcher) {
@@ -686,17 +1144,28 @@ func (i *storeInformer) stop() {
 
 // AddEventHandler adds an event handler to the informer.
 func (i *storeInformer) AddEventHandler(handler toolscache.ResourceEventHandler) (toolscache.ResourceEventHandlerRegistration, error) {
+	// Register + snapshot atomically: handlerMu.Lock blocks event delivery,
+	// so no events can reach the handler between registration and snapshot.
 	i.handlerMu.Lock()
-	defer i.handlerMu.Unlock()
-
 	id := i.nextID
 	i.nextID++
-
 	reg := handlerRegistration{
 		id:      id,
 		handler: handler,
 	}
 	i.handlers = append(i.handlers, reg)
+
+	i.mu.RLock()
+	existing := make([]client.Object, 0, len(i.objects))
+	for _, obj := range i.objects {
+		existing = append(existing, obj.DeepCopyObject().(client.Object))
+	}
+	i.mu.RUnlock()
+	i.handlerMu.Unlock()
+
+	for _, obj := range existing {
+		handler.OnAdd(obj, true)
+	}
 
 	return &resourceEventHandlerRegistration{
 		informer: i,
@@ -789,17 +1258,7 @@ func (d *informerDoneChecker) Name() string {
 }
 
 func (d *informerDoneChecker) Done() <-chan struct{} {
-	ch := make(chan struct{})
-	go func() {
-		for {
-			if d.informer.HasSynced() {
-				close(ch)
-				return
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-	}()
-	return ch
+	return d.informer.syncedCh
 }
 
 type resourceEventHandlerRegistration struct {

@@ -71,6 +71,7 @@ func NewStore(root string, scheme *runtime.Scheme, opts ...StoreOption) *FileSto
 		opt(s)
 	}
 	s.loadRevision()
+	s.loadUIDCounter()
 	return s
 }
 
@@ -206,7 +207,11 @@ func (s *FileStore) Create(ctx context.Context, obj client.Object) error {
 	}
 
 	if accessor.GetUID() == "" {
-		accessor.SetUID(types.UID(s.generateUID()))
+		uid, err := s.generateUID()
+		if err != nil {
+			return err
+		}
+		accessor.SetUID(types.UID(uid))
 	}
 
 	rv := s.revision.Add(1)
@@ -225,7 +230,9 @@ func (s *FileStore) Create(ctx context.Context, obj client.Object) error {
 		return err
 	}
 
-	s.persistRevision(rv)
+	if err := s.persistRevision(rv); err != nil {
+		return err
+	}
 
 	event := storectrl.Event{
 		Type:   storectrl.EventAdded,
@@ -291,7 +298,9 @@ func (s *FileStore) Update(ctx context.Context, obj client.Object) error {
 		return err
 	}
 
-	s.persistRevision(rv)
+	if err := s.persistRevision(rv); err != nil {
+		return err
+	}
 
 	event := storectrl.Event{
 		Type:   storectrl.EventModified,
@@ -336,14 +345,16 @@ func (s *FileStore) Delete(ctx context.Context, obj client.Object) error {
 		return err
 	}
 
-	deletedObj := storedObj.(client.Object)
+	deletedObj := storedObj.(client.Object).DeepCopyObject().(client.Object)
 	deletedAccessor, err := meta.Accessor(deletedObj)
 	if err != nil {
 		return err
 	}
 
 	rv := s.revision.Add(1)
-	s.persistRevision(rv)
+	if err := s.persistRevision(rv); err != nil {
+		return err
+	}
 	deletedAccessor.SetResourceVersion(strconv.FormatInt(rv, 10))
 
 	event := storectrl.Event{
@@ -416,9 +427,11 @@ func (s *FileStore) loadRevision() {
 	s.revision.Store(rv)
 }
 
-func (s *FileStore) persistRevision(rv int64) {
-	_ = os.MkdirAll(s.root, 0755)
-	_ = os.WriteFile(s.revisionPath(), []byte(strconv.FormatInt(rv, 10)), 0644)
+func (s *FileStore) persistRevision(rv int64) error {
+	if err := os.MkdirAll(s.root, 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(s.revisionPath(), []byte(strconv.FormatInt(rv, 10)), 0644)
 }
 
 func (s *FileStore) logEvent(gvk schema.GroupVersionKind, revision int64, event storectrl.Event) {
@@ -539,9 +552,31 @@ func (s *FileStore) populateListItems(list client.ObjectList, items []client.Obj
 	return nil
 }
 
-func (s *FileStore) generateUID() string {
+func (s *FileStore) generateUID() (string, error) {
 	id := s.uidCounter.Add(1)
-	return fmt.Sprintf("uid-%d", id)
+	if err := os.MkdirAll(s.root, 0755); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(s.uidPath(), []byte(strconv.FormatInt(id, 10)), 0644); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("uid-%d", id), nil
+}
+
+func (s *FileStore) uidPath() string {
+	return filepath.Join(s.root, ".uid-counter")
+}
+
+func (s *FileStore) loadUIDCounter() {
+	data, err := os.ReadFile(s.uidPath())
+	if err != nil {
+		return
+	}
+	uid, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return
+	}
+	s.uidCounter.Store(uid)
 }
 
 func (s *FileStore) notifyWatchers(gvk schema.GroupVersionKind, event storectrl.Event) {

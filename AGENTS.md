@@ -6,6 +6,8 @@ Instructions for AI agents working on this codebase.
 
 storectrl is a Go component library that provides `client.Client` and `cache.Cache` implementations backed by a pluggable `Store` interface instead of the Kubernetes API server. It lets developers write controllers using the standard reconciler pattern against any datastore, wired into controller-runtime's standard `manager.Manager` via factory overrides.
 
+storectrl must scale from small development setups to production workloads with large object counts (100K+ objects). Performance-sensitive areas: relist after watch reconnection, handler call overhead under high event rates, and cache memory footprint with remote backends. See `docs/deltafifo-evaluation.md` for the event processing scalability analysis.
+
 ## Module layout
 
 ```
@@ -15,7 +17,7 @@ storectrl/                 # Main package — all public API
 ├── errors.go             # NotFoundError, AlreadyExistsError, ConflictError, RevisionTooOldError
 ├── object.go             # BaseObject, BaseList (embed for client.Object compat)
 ├── client.go             # client.Client implementation wrapping Store
-├── cache.go              # cache.Cache implementation (watch-backed in-memory cache)
+├── cache.go              # cache.Cache implementation (watch-backed in-memory cache, CacheOption config)
 ├── example_test.go       # CRUD, concurrency, and reconciler tests
 ├── docs/migration.md     # Migration guide from controller-runtime
 ├── memory/               # In-memory Store backend
@@ -59,9 +61,11 @@ Convenience embeds. `BaseObject` = `metav1.TypeMeta` + `metav1.ObjectMeta`. Type
 
 3. **Errors implement `APIStatus`.** This is critical for transparent swapping. Controller code universally uses `apierrors.IsNotFound(err)` — our errors must satisfy that check without code changes.
 
-4. **Cache is watch-backed.** `storeCache` calls `Store.List` for initial sync, then `Store.Watch` for incremental updates. Reads go to the in-memory cache, not the store. Field indexers work the same as controller-runtime.
+4. **Cache is watch-backed and configurable.** `storeCache` calls `Store.List` for initial sync, then `Store.Watch` for incremental updates. Reads go to the in-memory cache, not the store. Field indexers work the same as controller-runtime. Configuration uses functional options (`CacheOption`) passed to `NewCache` — see design decision #6.
 
 5. **Component library, not a manager replacement.** storectrl provides `NewCache` and `NewClient` factory functions. Users wire these into controller-runtime's standard `manager.Manager` via `manager.Options` factory overrides (`NewCache`, `NewClient`). Manager lifecycle, leader election, health probes, and controller builder all stay with controller-runtime.
+
+6. **Cache options match controller-runtime where applicable.** `NewCache` accepts `CacheOption` functional options that mirror `cache.Options` from controller-runtime. Supported: `WithDefaultTransform`, `WithDefaultUnsafeDisableDeepCopy`, `WithDefaultLabelSelector`, `WithDefaultFieldSelector`, `WithDefaultEnableWatchBookmarks`, `WithDefaultNamespaces`, `WithByObject` (per-GVK overrides via `ByObjectConfig`), `WithReaderFailOnMissingInformer`, `WithSyncPeriod`. A `TransformStripManagedFields()` helper is provided. `EnableWatchBookmarks` is passed through to `Store.Watch` as a `client.ListOption` — backends honor or ignore it. `DefaultNamespaces` is a simplified version of CR's `map[string]cache.Config` — it accepts `[]string` of namespace names and filters objects by namespace in the cache; per-namespace config (selectors, transforms) is not supported. The `AllNamespaces` constant (empty string) includes all namespaces not explicitly listed. **Not supported** (K8s-specific, no Store equivalent): `HTTPClient`, `Mapper`, `NewInformer` (storectrl replaces the informer stack entirely; mix-and-match is possible — use `NewClient` with CR's standard cache, or vice versa), `WatchErrorHandler` (storectrl handles watch errors internally with exponential backoff). `ReaderFailOnMissingInformer` defaults to `true` for backward compatibility (Get/List error on unregistered types).
 
 ## Working with this code
 

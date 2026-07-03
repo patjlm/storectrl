@@ -80,15 +80,7 @@ func (c *storeClient) Patch(ctx context.Context, obj client.Object, patch client
 			return err
 		}
 	case types.MergePatchType, types.StrategicMergePatchType:
-		var currentMap, patchMap map[string]interface{}
-		if err := json.Unmarshal(currentBytes, &currentMap); err != nil {
-			return err
-		}
-		if err := json.Unmarshal(patchBytes, &patchMap); err != nil {
-			return err
-		}
-		merged := mergeMaps(currentMap, patchMap)
-		patchedBytes, err = json.Marshal(merged)
+		patchedBytes, err = jsonpatch.MergePatch(currentBytes, patchBytes)
 		if err != nil {
 			return err
 		}
@@ -241,25 +233,4 @@ func (s *storeSubResourceClient) Patch(ctx context.Context, obj client.Object, p
 
 func (s *storeSubResourceClient) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
 	return s.client.store.Apply(ctx, obj)
-}
-
-func mergeMaps(base, patch map[string]interface{}) map[string]interface{} {
-	result := make(map[string]interface{})
-	for k, v := range base {
-		result[k] = v
-	}
-	for k, v := range patch {
-		if v == nil {
-			delete(result, k)
-			continue
-		}
-		if baseMap, ok := result[k].(map[string]interface{}); ok {
-			if patchMap, ok := v.(map[string]interface{}); ok {
-				result[k] = mergeMaps(baseMap, patchMap)
-				continue
-			}
-		}
-		result[k] = v
-	}
-	return result
 }

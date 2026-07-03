@@ -36,6 +36,31 @@ mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 
 Everything else stays the same -- controller setup, reconciler code, `mgr.Start()`.
 
+### With cache options
+
+`NewCache` accepts functional options that mirror controller-runtime's `cache.Options`:
+
+```go
+store := memory.NewStore(scheme)
+
+mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
+    Scheme: scheme,
+    NewCache: func(cfg *rest.Config, opts cache.Options) (cache.Cache, error) {
+        return storectrl.NewCache(store, scheme,
+            storectrl.WithDefaultTransform(storectrl.TransformStripManagedFields()),
+            storectrl.WithDefaultUnsafeDisableDeepCopy(true),
+            storectrl.WithSyncPeriod(30*time.Second),
+            storectrl.WithByObject(&Widget{}, storectrl.ByObjectConfig{
+                Label: labels.SelectorFromSet(labels.Set{"env": "production"}),
+            }),
+        ), nil
+    },
+    NewClient: func(c cache.Cache, cfg *rest.Config, opts client.Options, uncachedObjects ...client.Object) (client.Client, error) {
+        return storectrl.NewClient(store, scheme), nil
+    },
+})
+```
+
 ### What You Keep from controller-runtime
 
 Because storectrl plugs into the standard manager, you get all of its operational features for free:
@@ -173,6 +198,91 @@ See `memory/store.go` as a reference implementation. Key requirements:
 - **Overflow handling**: When a watcher's channel buffer is full, close the watch (not silently drop events) so consumers can reconnect and replay.
 - **UID generation**: Create must generate a unique UID if not already set.
 - **Apply**: Implement server-side-apply-style merges if your backend supports it, or return a clear error.
+
+## Cache Configuration
+
+`NewCache` accepts `CacheOption` functional options. These mirror controller-runtime's `cache.Options` where applicable.
+
+### Available Options
+
+| Option | Description |
+|---|---|
+| `WithDefaultTransform(fn)` | Transform objects before caching. Reduces memory for large objects. |
+| `WithDefaultUnsafeDisableDeepCopy(bool)` | Skip deep copy on cache reads (Get/List). Caller must DeepCopy before mutating. |
+| `WithDefaultLabelSelector(sel)` | Filter objects entering the cache by label. Passed to Store.List/Watch. |
+| `WithDefaultFieldSelector(sel)` | Filter by metadata fields (metadata.name, metadata.namespace). Passed to Store.List/Watch. |
+| `WithDefaultEnableWatchBookmarks(bool)` | Request backends to send BOOKMARK events during Watch. Passed as `EnableWatchBookmarks` ListOption to Store.Watch. Backends honor or ignore. |
+| `WithDefaultNamespaces([]string)` | Restrict cache to objects from listed namespaces. Use `AllNamespaces` ("") to include unlisted namespaces. Simplified version of CR's `map[string]cache.Config`. |
+| `WithByObject(obj, config)` | Per-GVK overrides via `ByObjectConfig` (Transform, UnsafeDisableDeepCopy, Label, Field, EnableWatchBookmarks). |
+| `WithReaderFailOnMissingInformer(bool)` | When true (default), Get/List return error for unregistered types. When false, auto-creates informers. |
+| `WithSyncPeriod(d)` | Periodic resync: delivers synthetic OnUpdate events for all cached objects to event handlers. |
+
+### Helpers
+
+`TransformStripManagedFields()` returns a transform that strips `managedFields` from objects before caching. Useful when managedFields are not needed and you want to reduce memory:
+
+```go
+storectrl.NewCache(store, scheme,
+    storectrl.WithDefaultTransform(storectrl.TransformStripManagedFields()),
+)
+```
+
+### Per-GVK Configuration
+
+Use `WithByObject` to override defaults for specific types:
+
+```go
+storectrl.NewCache(store, scheme,
+    storectrl.WithDefaultUnsafeDisableDeepCopy(true),
+    storectrl.WithByObject(&Widget{}, storectrl.ByObjectConfig{
+        UnsafeDisableDeepCopy: ptr.To(false), // override: deep copy Widgets
+        Label: labels.SelectorFromSet(labels.Set{"tier": "control-plane"}),
+    }),
+)
+```
+
+### Namespace Filtering
+
+`WithDefaultNamespaces` restricts the cache to objects from specific namespaces:
+
+```go
+storectrl.NewCache(store, scheme,
+    storectrl.WithDefaultNamespaces([]string{"prod", "staging"}),
+)
+```
+
+Use `AllNamespaces` (empty string) to include all namespaces not explicitly listed:
+
+```go
+storectrl.NewCache(store, scheme,
+    storectrl.WithDefaultNamespaces([]string{"prod", storectrl.AllNamespaces}),
+)
+```
+
+This is a simplified version of controller-runtime's `DefaultNamespaces map[string]cache.Config`. CR creates separate informers per namespace with independent configurations. storectrl filters by namespace in the cache layer instead. Per-namespace configuration (different selectors, transforms per namespace) is not supported — use `WithByObject` for per-type configuration.
+
+### Mix-and-Match: Custom Informer + Store Client
+
+`NewCache` and `NewClient` are independent. You can combine storectrl components with controller-runtime's standard implementations:
+
+```go
+// storectrl client + CR standard cache (e.g., for types that need K8s API caching)
+mgr, _ := ctrl.NewManager(restConfig, ctrl.Options{
+    NewClient: func(c cache.Cache, cfg *rest.Config, opts client.Options, ...) (client.Client, error) {
+        return storectrl.NewClient(store, scheme), nil
+    },
+    // Uses CR's default cache backed by the API server
+})
+```
+
+Controller-runtime's `NewInformer` factory (`func(ListerWatcher, Object, Duration, Indexers) SharedIndexInformer`) does NOT compose with storectrl — it creates `SharedIndexInformer` instances that talk to a Kubernetes API server via `ListerWatcher`. storectrl replaces the entire informer stack with `storeInformer` that talks to `Store` directly.
+
+### Unsupported controller-runtime Options
+
+These `cache.Options` fields are K8s-specific and have no Store equivalent:
+
+- **HTTPClient, Mapper, NewInformer** -- K8s REST plumbing. storectrl replaces the informer stack entirely; see mix-and-match above for composition patterns.
+- **WatchErrorHandler** -- storectrl handles watch errors internally with exponential backoff and automatic reconnection.
 
 ## Limitations
 
