@@ -18,6 +18,7 @@ storectrl/                 # Main package — all public API
 ├── object.go             # BaseObject, BaseList (embed for client.Object compat)
 ├── client.go             # client.Client implementation wrapping Store
 ├── cache.go              # cache.Cache implementation (watch-backed in-memory cache, CacheOption config)
+├── listerwatcher.go      # StoreListerWatcher adapter (Store → client-go ListerWatcher)
 ├── example_test.go       # CRUD, concurrency, and reconciler tests
 ├── docs/migration.md     # Migration guide from controller-runtime
 ├── memory/               # In-memory Store backend

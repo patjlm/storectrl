@@ -275,14 +275,53 @@ mgr, _ := ctrl.NewManager(restConfig, ctrl.Options{
 })
 ```
 
-Controller-runtime's `NewInformer` factory (`func(ListerWatcher, Object, Duration, Indexers) SharedIndexInformer`) does NOT compose with storectrl — it creates `SharedIndexInformer` instances that talk to a Kubernetes API server via `ListerWatcher`. storectrl replaces the entire informer stack with `storeInformer` that talks to `Store` directly.
+Controller-runtime's `NewInformer` factory can compose with storectrl via `StoreListerWatcher` — see [Alternative: StoreListerWatcher](#alternative-storelisterwatcher) below.
 
 ### Unsupported controller-runtime Options
 
 These `cache.Options` fields are K8s-specific and have no Store equivalent:
 
-- **HTTPClient, Mapper, NewInformer** -- K8s REST plumbing. storectrl replaces the informer stack entirely; see mix-and-match above for composition patterns.
+- **HTTPClient, Mapper** -- K8s REST plumbing. storectrl replaces the informer stack entirely.
+- **NewInformer** -- not used by `storectrl.NewCache`, but composable via `StoreListerWatcher` (see [below](#alternative-storelisterwatcher)).
 - **WatchErrorHandler** -- storectrl handles watch errors internally with exponential backoff and automatic reconnection.
+
+## Alternative: StoreListerWatcher
+
+`StoreListerWatcher` adapts a `Store` into a client-go `ListerWatcher`, letting you use controller-runtime's full informer stack (Reflector, DeltaFIFO, SharedIndexInformer) against any Store backend.
+
+This is opt-in. The default `NewCache` replaces the informer stack entirely. Use `StoreListerWatcher` when you want DeltaFIFO event coalescing, full multi-namespace support (per-namespace informers), or automatic adoption of future CR cache features — and accept the coupling to CR internals.
+
+### Usage with CR's NewInformer
+
+```go
+mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
+    Scheme: scheme,
+    NewCache: func(cfg *rest.Config, opts cache.Options) (cache.Cache, error) {
+        return cache.New(cfg, cache.Options{
+            Scheme:     scheme,
+            HTTPClient: http.DefaultClient,
+            Mapper:     meta.NewDefaultRESTMapper([]schema.GroupVersion{}),
+            NewInformer: func(lw toolscache.ListerWatcher, obj runtime.Object, d time.Duration, idx toolscache.Indexers) toolscache.SharedIndexInformer {
+                // Substitute the REST-based lw with a Store-backed one.
+                storeLW := storectrl.NewStoreListerWatcher(store, &WidgetList{})
+                return toolscache.NewSharedIndexInformer(storeLW, obj, d, idx)
+            },
+        })
+    },
+})
+```
+
+### Trade-offs
+
+| Aspect | NewCache (default) | StoreListerWatcher |
+|---|---|---|
+| CR feature parity | Manual catch-up | Automatic |
+| Multi-namespace | Simplified (namespace filter) | Full (per-NS informer) |
+| DeltaFIFO | No (direct event delivery) | Yes (coalesces rapid updates) |
+| K8s coupling | Low | Higher (dummy restConfig, CR internals) |
+| Debugging | Simple (our code) | Harder (CR internals + adapter) |
+
+See [docs/listerwatcher-adapter.md](listerwatcher-adapter.md) for the full design evaluation.
 
 ## Limitations
 
