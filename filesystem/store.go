@@ -109,6 +109,10 @@ func (s *FileStore) List(ctx context.Context, list client.ObjectList, opts ...cl
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	if setter, ok := list.(interface{ SetResourceVersion(string) }); ok {
+		setter.SetResourceVersion(strconv.FormatInt(s.revision.Load(), 10))
+	}
+
 	dir := gvkDir(s.root, gvk)
 	var items []client.Object
 
@@ -175,10 +179,6 @@ func (s *FileStore) List(ctx context.Context, list client.ObjectList, opts ...cl
 
 			items = append(items, clientObj)
 		}
-	}
-
-	if setter, ok := list.(interface{ SetResourceVersion(string) }); ok {
-		setter.SetResourceVersion(strconv.FormatInt(s.revision.Load(), 10))
 	}
 
 	return s.populateListItems(list, items)
