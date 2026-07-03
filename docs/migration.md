@@ -317,11 +317,11 @@ mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 |---|---|---|
 | CR feature parity | Manual catch-up | Automatic |
 | Multi-namespace | Simplified (namespace filter) | Full (per-NS informer) |
-| DeltaFIFO | No (direct event delivery) | Yes (coalesces rapid updates) |
+| DeltaFIFO | No (async event queue with per-key coalescing) | Yes (full delta history per object) |
 | K8s coupling | Low | Higher (dummy restConfig, CR internals) |
 | Debugging | Simple (our code) | Harder (CR internals + adapter) |
 
-See [docs/listerwatcher-adapter.md](listerwatcher-adapter.md) for the full design evaluation.
+**Caveats:** The adapter requires a dummy `rest.Config{}` passed to `cache.New` — if CR adds config validation in a future version, this may break. The adapter translates `LabelSelector` and `ResourceVersion` from `metav1.ListOptions`; other options (pagination, field selectors, timeouts) are ignored — CR's Reflector handles unsupported options gracefully.
 
 ## Limitations
 
