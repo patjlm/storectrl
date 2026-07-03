@@ -42,7 +42,7 @@ func (s *StoreListerWatcher) List(options metav1.ListOptions) (runtime.Object, e
 func (s *StoreListerWatcher) ListWithContext(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
 	listCopy := s.listObj.DeepCopyObject().(client.ObjectList)
 
-	opts, err := parseListOpts(options)
+	opts, _, err := parseListOpts(options)
 	if err != nil {
 		return nil, err
 	}
@@ -60,13 +60,13 @@ func (s *StoreListerWatcher) Watch(options metav1.ListOptions) (watch.Interface,
 func (s *StoreListerWatcher) WatchWithContext(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
 	listCopy := s.listObj.DeepCopyObject().(client.ObjectList)
 
-	listOpts, err := parseListOpts(options)
+	listOpts, sel, err := parseListOpts(options)
 	if err != nil {
 		return nil, err
 	}
 
 	if options.SendInitialEvents != nil && *options.SendInitialEvents {
-		return s.watchWithInitialEvents(ctx, listCopy, listOpts)
+		return s.watchWithInitialEvents(ctx, listCopy, listOpts, sel)
 	}
 
 	if options.ResourceVersion != "" {
@@ -81,13 +81,13 @@ func (s *StoreListerWatcher) WatchWithContext(ctx context.Context, options metav
 	if err != nil {
 		return nil, err
 	}
-	return newWatchAdapter(watcher), nil
+	return newWatchAdapter(watcher, sel), nil
 }
 
 // watchWithInitialEvents implements the watchList protocol: List all objects,
 // send each as ADDED, send a BOOKMARK with the list's ResourceVersion, then
 // relay live events from Watch(fromRevision=listRV).
-func (s *StoreListerWatcher) watchWithInitialEvents(ctx context.Context, listObj client.ObjectList, opts []client.ListOption) (watch.Interface, error) {
+func (s *StoreListerWatcher) watchWithInitialEvents(ctx context.Context, listObj client.ObjectList, opts []client.ListOption, sel labels.Selector) (watch.Interface, error) {
 	if err := s.store.List(ctx, listObj, opts...); err != nil {
 		return nil, err
 	}
@@ -114,19 +114,41 @@ func (s *StoreListerWatcher) watchWithInitialEvents(ctx context.Context, listObj
 	}
 
 	bookmark := bookmarkForList(s.listObj, rv)
-	return newInitialEventsAdapter(watcher, items, bookmark), nil
+	return newInitialEventsAdapter(watcher, items, bookmark, sel), nil
 }
 
-func parseListOpts(options metav1.ListOptions) ([]client.ListOption, error) {
+func parseListOpts(options metav1.ListOptions) ([]client.ListOption, labels.Selector, error) {
 	var opts []client.ListOption
+	var sel labels.Selector
 	if options.LabelSelector != "" {
-		sel, err := labels.Parse(options.LabelSelector)
+		var err error
+		sel, err = labels.Parse(options.LabelSelector)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		opts = append(opts, client.MatchingLabelsSelector{Selector: sel})
 	}
-	return opts, nil
+	return opts, sel, nil
+}
+
+type objectLabelSet map[string]string
+
+func (l objectLabelSet) Has(label string) bool {
+	_, ok := l[label]
+	return ok
+}
+
+func (l objectLabelSet) Get(label string) string {
+	return l[label]
+}
+
+func (l objectLabelSet) Lookup(label string) (string, bool) {
+	v, ok := l[label]
+	return v, ok
+}
+
+func labelSetFromObject(obj client.Object) labels.Labels {
+	return objectLabelSet(obj.GetLabels())
 }
 
 var _ toolscache.ListerWatcher = &StoreListerWatcher{}
@@ -138,13 +160,15 @@ type watchAdapter struct {
 	ch       chan watch.Event
 	stopCh   chan struct{}
 	stopOnce sync.Once
+	selector labels.Selector
 }
 
-func newWatchAdapter(inner Watcher) *watchAdapter {
+func newWatchAdapter(inner Watcher, selector labels.Selector) *watchAdapter {
 	a := &watchAdapter{
-		inner:  inner,
-		ch:     make(chan watch.Event, 100),
-		stopCh: make(chan struct{}),
+		inner:    inner,
+		ch:       make(chan watch.Event, 100),
+		stopCh:   make(chan struct{}),
+		selector: selector,
 	}
 	go a.relay()
 	return a
@@ -159,6 +183,11 @@ func (a *watchAdapter) relay() {
 		case evt, ok := <-a.inner.ResultChan():
 			if !ok {
 				return
+			}
+			if a.selector != nil && evt.Type != EventBookmark {
+				if !a.selector.Matches(labelSetFromObject(evt.Object)) {
+					continue
+				}
 			}
 			watchEvt := watch.Event{
 				Object: evt.Object,
@@ -203,13 +232,15 @@ type initialEventsAdapter struct {
 	ch       chan watch.Event
 	stopCh   chan struct{}
 	stopOnce sync.Once
+	selector labels.Selector
 }
 
-func newInitialEventsAdapter(inner Watcher, items []runtime.Object, bookmarkObj runtime.Object) *initialEventsAdapter {
+func newInitialEventsAdapter(inner Watcher, items []runtime.Object, bookmarkObj runtime.Object, selector labels.Selector) *initialEventsAdapter {
 	a := &initialEventsAdapter{
-		inner:  inner,
-		ch:     make(chan watch.Event, 100),
-		stopCh: make(chan struct{}),
+		inner:    inner,
+		ch:       make(chan watch.Event, 100),
+		stopCh:   make(chan struct{}),
+		selector: selector,
 	}
 	go a.run(items, bookmarkObj)
 	return a
@@ -241,6 +272,11 @@ func (a *initialEventsAdapter) run(items []runtime.Object, bookmarkObj runtime.O
 		case evt, ok := <-a.inner.ResultChan():
 			if !ok {
 				return
+			}
+			if a.selector != nil && evt.Type != EventBookmark {
+				if !a.selector.Matches(labelSetFromObject(evt.Object)) {
+					continue
+				}
 			}
 			watchEvt := watch.Event{Object: evt.Object}
 			switch evt.Type {

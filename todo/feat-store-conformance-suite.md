@@ -55,7 +55,7 @@ type Config struct {
 - Streams Add/Update/Delete events
 - `WatchFromRevision` replays past events
 - `RevisionTooOldError` when revision is compacted (if applicable)
-- Watch label selector filtering (once bug-watch-label-selector.md is fixed)
+- Watch label selector filtering (replay filtered by backends, live filtered by StoreListerWatcher adapter)
 
 **Apply (optional):**
 - Basic apply works if `SupportsApply` is true

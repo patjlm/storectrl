@@ -312,11 +312,13 @@ func (s *MemoryStore) Watch(ctx context.Context, list client.ObjectList, opts ..
 
 	var fromRevision int64
 	resuming := false
+	listOpts := &client.ListOptions{}
 	for _, opt := range opts {
 		if rv, ok := opt.(storectrl.WatchFromRevision); ok {
 			fromRevision = int64(rv)
 			resuming = true
 		}
+		opt.ApplyToList(listOpts)
 	}
 
 	s.mu.Lock()
@@ -328,6 +330,16 @@ func (s *MemoryStore) Watch(ctx context.Context, list client.ObjectList, opts ..
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	if listOpts.LabelSelector != nil {
+		filtered := make([]storectrl.Event, 0, len(replay))
+		for _, evt := range replay {
+			if evt.Type == storectrl.EventBookmark || listOpts.LabelSelector.Matches(toLabelSet(evt.Object.GetLabels())) {
+				filtered = append(filtered, evt)
+			}
+		}
+		replay = filtered
 	}
 
 	bufSize := 100

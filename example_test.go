@@ -1474,6 +1474,87 @@ func TestCacheWithDefaultNamespacesAllNamespaces(t *testing.T) {
 	}
 }
 
+func TestWatchLabelSelectorReplay(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme()
+	store := memory.NewStore(scheme, memory.WithEventLogSize(100))
+
+	blue := newWidget("w-blue", "blue", 1)
+	blue.SetLabels(map[string]string{"color": "blue"})
+	if err := store.Create(ctx, blue); err != nil {
+		t.Fatalf("create blue: %v", err)
+	}
+
+	red := newWidget("w-red", "red", 2)
+	red.SetLabels(map[string]string{"color": "red"})
+	if err := store.Create(ctx, red); err != nil {
+		t.Fatalf("create red: %v", err)
+	}
+
+	blue2 := newWidget("w-blue2", "blue", 3)
+	blue2.SetLabels(map[string]string{"color": "blue"})
+	if err := store.Create(ctx, blue2); err != nil {
+		t.Fatalf("create blue2: %v", err)
+	}
+
+	sel, err := labels.Parse("color=blue")
+	if err != nil {
+		t.Fatalf("parse selector: %v", err)
+	}
+
+	t.Run("replay events filtered by selector", func(t *testing.T) {
+		watcher, err := store.Watch(ctx, &WidgetList{},
+			storectrl.WatchFromRevision(0),
+			client.MatchingLabelsSelector{Selector: sel},
+		)
+		if err != nil {
+			t.Fatalf("watch: %v", err)
+		}
+		defer watcher.Stop()
+
+		var names []string
+		for {
+			select {
+			case evt := <-watcher.ResultChan():
+				names = append(names, evt.Object.GetName())
+			case <-time.After(100 * time.Millisecond):
+				goto done
+			}
+		}
+	done:
+		for _, name := range names {
+			if name != "w-blue" && name != "w-blue2" {
+				t.Errorf("replay contained non-blue object: %s", name)
+			}
+		}
+		if len(names) != 2 {
+			t.Errorf("expected 2 blue replay events, got %d: %v", len(names), names)
+		}
+	})
+
+	t.Run("no selector replays all events", func(t *testing.T) {
+		watcher, err := store.Watch(ctx, &WidgetList{}, storectrl.WatchFromRevision(0))
+		if err != nil {
+			t.Fatalf("watch: %v", err)
+		}
+		defer watcher.Stop()
+
+		count := 0
+		for {
+			select {
+			case <-watcher.ResultChan():
+				count++
+			case <-time.After(100 * time.Millisecond):
+				goto done2
+			}
+		}
+	done2:
+		if count != 3 {
+			t.Errorf("expected 3 replay events without selector, got %d", count)
+		}
+	})
+}
+
 func TestCacheWithEnableWatchBookmarks(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
