@@ -42,13 +42,9 @@ func (s *StoreListerWatcher) List(options metav1.ListOptions) (runtime.Object, e
 func (s *StoreListerWatcher) ListWithContext(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
 	listCopy := s.listObj.DeepCopyObject().(client.ObjectList)
 
-	var opts []client.ListOption
-	if options.LabelSelector != "" {
-		sel, err := labels.Parse(options.LabelSelector)
-		if err != nil {
-			return nil, err
-		}
-		opts = append(opts, client.MatchingLabelsSelector{Selector: sel})
+	opts, err := parseListOpts(options)
+	if err != nil {
+		return nil, err
 	}
 
 	if err := s.store.List(ctx, listCopy, opts...); err != nil {
@@ -64,13 +60,9 @@ func (s *StoreListerWatcher) Watch(options metav1.ListOptions) (watch.Interface,
 func (s *StoreListerWatcher) WatchWithContext(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
 	listCopy := s.listObj.DeepCopyObject().(client.ObjectList)
 
-	var listOpts []client.ListOption
-	if options.LabelSelector != "" {
-		sel, err := labels.Parse(options.LabelSelector)
-		if err != nil {
-			return nil, err
-		}
-		listOpts = append(listOpts, client.MatchingLabelsSelector{Selector: sel})
+	listOpts, err := parseListOpts(options)
+	if err != nil {
+		return nil, err
 	}
 
 	if options.SendInitialEvents != nil && *options.SendInitialEvents {
@@ -123,6 +115,18 @@ func (s *StoreListerWatcher) watchWithInitialEvents(ctx context.Context, listObj
 
 	bookmark := bookmarkForList(s.listObj, rv)
 	return newInitialEventsAdapter(watcher, items, bookmark), nil
+}
+
+func parseListOpts(options metav1.ListOptions) ([]client.ListOption, error) {
+	var opts []client.ListOption
+	if options.LabelSelector != "" {
+		sel, err := labels.Parse(options.LabelSelector)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, client.MatchingLabelsSelector{Selector: sel})
+	}
+	return opts, nil
 }
 
 var _ toolscache.ListerWatcher = &StoreListerWatcher{}
