@@ -1027,6 +1027,10 @@ func (i *storeInformer) add(obj client.Object) {
 	key := client.ObjectKeyFromObject(transformed)
 
 	i.mu.Lock()
+	if existing, exists := i.objects[key]; exists && !newerResourceVersion(transformed.GetResourceVersion(), existing.GetResourceVersion()) {
+		i.mu.Unlock()
+		return
+	}
 	i.objects[key] = transformed.DeepCopyObject().(client.Object)
 	i.rebuildIndicesForObject(key, transformed)
 	i.mu.Unlock()
@@ -1044,6 +1048,10 @@ func (i *storeInformer) update(obj client.Object) {
 	if !matches {
 		i.mu.Lock()
 		cached, existed := i.objects[key]
+		if existed && !newerResourceVersion(obj.GetResourceVersion(), cached.GetResourceVersion()) {
+			i.mu.Unlock()
+			return
+		}
 		if existed {
 			delete(i.objects, key)
 			i.removeFromIndices(key)
@@ -1066,6 +1074,10 @@ func (i *storeInformer) update(obj client.Object) {
 
 	i.mu.Lock()
 	oldObj, exists := i.objects[key]
+	if exists && !newerResourceVersion(transformed.GetResourceVersion(), oldObj.GetResourceVersion()) {
+		i.mu.Unlock()
+		return
+	}
 	i.objects[key] = transformed.DeepCopyObject().(client.Object)
 	i.rebuildIndicesForObject(key, transformed)
 	i.mu.Unlock()
@@ -1415,6 +1427,15 @@ func (r *resourceEventHandlerRegistration) HasSynced() bool {
 
 func (r *resourceEventHandlerRegistration) HasSyncedChecker() toolscache.DoneChecker {
 	return r.informer.HasSyncedChecker()
+}
+
+func newerResourceVersion(incoming, existing string) bool {
+	inRV, inErr := strconv.ParseInt(incoming, 10, 64)
+	exRV, exErr := strconv.ParseInt(existing, 10, 64)
+	if inErr == nil && exErr == nil {
+		return inRV > exRV
+	}
+	return incoming != existing
 }
 
 var _ cache.Cache = &storeCache{}

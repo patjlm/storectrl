@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -239,6 +240,10 @@ func (s *MemoryStore) Update(ctx context.Context, obj client.Object) error {
 		return &storectrl.ConflictError{Key: key.String()}
 	}
 
+	if s.contentEqual(stored, obj) {
+		return s.copyObject(stored, obj)
+	}
+
 	rv := s.revision.Add(1)
 	objAccessor.SetResourceVersion(strconv.FormatInt(rv, 10))
 
@@ -387,6 +392,18 @@ func (s *MemoryStore) gvkForList(list client.ObjectList) (schema.GroupVersionKin
 	}
 
 	return gvk, nil
+}
+
+func (s *MemoryStore) contentEqual(stored, incoming client.Object) bool {
+	inCopy := incoming.DeepCopyObject().(client.Object)
+	inCopy.SetResourceVersion(stored.GetResourceVersion())
+	inCopy.SetUID(stored.GetUID())
+	a, err1 := json.Marshal(stored)
+	b, err2 := json.Marshal(inCopy)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return bytes.Equal(a, b)
 }
 
 func (s *MemoryStore) copyObject(src, dst client.Object) error {

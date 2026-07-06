@@ -30,6 +30,29 @@ func (e EnableWatchBookmarks) ApplyToList(_ *client.ListOptions) {}
 // requiring a Kubernetes API server.
 //
 // Implementations must be safe for concurrent use.
+//
+// # Backend invariants
+//
+// ResourceVersion must be a numeric string parseable via strconv.ParseInt.
+// It increases monotonically with each mutation — no gaps are required but
+// the value must never decrease.
+//
+// List must return a snapshot-consistent view: all returned objects reflect
+// state at a single point in time.
+//
+// Watch events must be delivered in revision order. When WatchFromRevision
+// is supplied, the backend must not skip any events between that revision
+// and the current state.
+//
+// Optimistic concurrency: Update must reject an object whose ResourceVersion
+// does not match the stored value with a ConflictError.
+//
+// No-op suppression is recommended but not required. If the new object is
+// byte-identical to the stored one, the backend may skip the revision bump
+// and event emission.
+//
+// Backends supporting sharded or fenced writes may return FencedError from
+// Create, Update, or Delete when the caller's lease is lost.
 type Store interface {
 	// Get retrieves an object by namespace/name key and populates obj.
 	// Returns a NotFoundError if the object does not exist.
@@ -41,13 +64,16 @@ type Store interface {
 	// Create persists a new object. Implementations should set UID and
 	// ResourceVersion on the object before returning.
 	// Returns an AlreadyExistsError if the object already exists.
+	// May return FencedError for backends with lease-based fencing.
 	Create(ctx context.Context, obj client.Object) error
 
 	// Update replaces an existing object. Returns a ConflictError if the
 	// ResourceVersion does not match (optimistic concurrency).
+	// May return FencedError for backends with lease-based fencing.
 	Update(ctx context.Context, obj client.Object) error
 
 	// Delete removes an object. Returns a NotFoundError if not found.
+	// May return FencedError for backends with lease-based fencing.
 	Delete(ctx context.Context, obj client.Object) error
 
 	// Watch returns a Watcher that streams change events for the given type.

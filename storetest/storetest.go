@@ -52,6 +52,18 @@ type Config struct {
 	// at most one event per object (current state) per poll cycle. Set this flag
 	// together with SkipWatchEventHistory when using a polling backend.
 	SkipConcurrencyWatchCount bool
+
+	// SkipGlobalRevisionMonotonicity declares the backend uses per-object
+	// versioning instead of a global revision counter. Watch events may have
+	// non-monotonic ResourceVersions across different objects. Backends like
+	// postgres use object_version for ResourceVersion, which is monotonic
+	// within a single object but not globally.
+	SkipGlobalRevisionMonotonicity bool
+
+	// SkipNoopSuppression declares the backend does not implement no-op
+	// suppression. The Store interface says no-op suppression is "recommended
+	// but not required" — backends without it should set this flag.
+	SkipNoopSuppression bool
 }
 
 // TestStore runs the full Store conformance suite against the given backend.
@@ -73,6 +85,7 @@ func TestStore(t *testing.T, cfg Config) {
 	t.Run("Watch", func(t *testing.T) { testWatch(t, cfg) })
 	t.Run("Apply", func(t *testing.T) { testApply(t, cfg) })
 	t.Run("Concurrency", func(t *testing.T) { testConcurrency(t, cfg) })
+	t.Run("Invariants", func(t *testing.T) { testInvariants(t, cfg) })
 }
 
 // --- internal test types ---
@@ -927,6 +940,251 @@ func testConcurrency(t *testing.T, cfg Config) {
 			if count != expected {
 				t.Errorf("expected %d events, got %d", expected, count)
 			}
+		}
+	})
+}
+
+// --- Invariants ---
+
+func testInvariants(t *testing.T, cfg Config) {
+	t.Run("revision_monotonicity_in_watch", func(t *testing.T) {
+		if cfg.SkipGlobalRevisionMonotonicity {
+			t.Skip("backend uses per-object versioning, not global revision monotonicity")
+		}
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		watcher, err := store.Watch(ctx, &testWidgetList{})
+		if err != nil {
+			t.Fatalf("watch: %v", err)
+		}
+		defer watcher.Stop()
+
+		for i := 0; i < 10; i++ {
+			w := newTestWidget(fmt.Sprintf("mono-%d", i), "blue", i)
+			if err := store.Create(ctx, w); err != nil {
+				t.Fatalf("create %d: %v", i, err)
+			}
+		}
+
+		var prevRV int64
+		for i := 0; i < 10; i++ {
+			select {
+			case evt := <-watcher.ResultChan():
+				rv, err := strconv.ParseInt(evt.Object.GetResourceVersion(), 10, 64)
+				if err != nil {
+					t.Fatalf("event %d: non-numeric ResourceVersion %q", i, evt.Object.GetResourceVersion())
+				}
+				if rv <= prevRV {
+					t.Errorf("event %d: ResourceVersion %d <= previous %d (monotonicity violated)", i, rv, prevRV)
+				}
+				prevRV = rv
+			case <-time.After(time.Second):
+				t.Fatalf("timeout at event %d", i)
+			}
+		}
+	})
+
+	t.Run("noop_update_suppresses_event", func(t *testing.T) {
+		if cfg.SkipNoopSuppression {
+			t.Skip("backend does not implement no-op suppression")
+		}
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		w := newTestWidget("noop", "blue", 42)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+
+		watcher, err := store.Watch(ctx, &testWidgetList{},
+			storectrl.WatchFromRevision(1))
+		if err != nil {
+			t.Fatalf("watch: %v", err)
+		}
+		defer watcher.Stop()
+
+		rvBefore := w.GetResourceVersion()
+
+		// Update with identical content
+		if err := store.Update(ctx, w); err != nil {
+			t.Fatalf("noop update: %v", err)
+		}
+
+		rvAfter := w.GetResourceVersion()
+		if rvAfter != rvBefore {
+			t.Errorf("no-op update should preserve ResourceVersion: before=%s after=%s", rvBefore, rvAfter)
+		}
+
+		// No event should be emitted
+		select {
+		case evt := <-watcher.ResultChan():
+			t.Errorf("no-op update should not emit event, got %s for %s", evt.Type, evt.Object.GetName())
+		case <-time.After(100 * time.Millisecond):
+			// expected — no event
+		}
+	})
+
+	t.Run("list_returns_consistent_snapshot", func(t *testing.T) {
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		for i := 0; i < 5; i++ {
+			w := newTestWidget(fmt.Sprintf("snap-%d", i), "blue", i)
+			if err := store.Create(ctx, w); err != nil {
+				t.Fatalf("create %d: %v", i, err)
+			}
+		}
+
+		list := &testWidgetList{}
+		if err := store.List(ctx, list); err != nil {
+			t.Fatalf("list: %v", err)
+		}
+
+		// List RV should be >= all object RVs (consistent snapshot)
+		listRV, err := strconv.ParseInt(list.GetResourceVersion(), 10, 64)
+		if err != nil {
+			t.Fatalf("list RV non-numeric: %s", list.GetResourceVersion())
+		}
+
+		for _, item := range list.Items {
+			objRV, err := strconv.ParseInt(item.GetResourceVersion(), 10, 64)
+			if err != nil {
+				t.Fatalf("object RV non-numeric: %s", item.GetResourceVersion())
+			}
+			if objRV > listRV {
+				t.Errorf("object %s RV=%d > list RV=%d (inconsistent snapshot)", item.Name, objRV, listRV)
+			}
+		}
+	})
+
+	t.Run("watch_resumption_no_gap", func(t *testing.T) {
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		w1 := newTestWidget("gap-1", "blue", 1)
+		if err := store.Create(ctx, w1); err != nil {
+			t.Fatalf("create w1: %v", err)
+		}
+		w2 := newTestWidget("gap-2", "red", 2)
+		if err := store.Create(ctx, w2); err != nil {
+			t.Fatalf("create w2: %v", err)
+		}
+
+		// Watch from revision 1 — should see w2 (created at revision 2)
+		watcher, err := store.Watch(ctx, &testWidgetList{}, storectrl.WatchFromRevision(1))
+		if err != nil {
+			t.Fatalf("watch: %v", err)
+		}
+
+		select {
+		case evt := <-watcher.ResultChan():
+			if evt.Object.GetName() != "gap-2" {
+				t.Errorf("expected gap-2, got %s", evt.Object.GetName())
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timeout waiting for resumed event")
+		}
+		watcher.Stop()
+
+		// Create more objects, then resume from w2's revision
+		w3 := newTestWidget("gap-3", "green", 3)
+		if err := store.Create(ctx, w3); err != nil {
+			t.Fatalf("create w3: %v", err)
+		}
+
+		watcher2, err := store.Watch(ctx, &testWidgetList{}, storectrl.WatchFromRevision(2))
+		if err != nil {
+			t.Fatalf("watch from 2: %v", err)
+		}
+		defer watcher2.Stop()
+
+		select {
+		case evt := <-watcher2.ResultChan():
+			if evt.Object.GetName() != "gap-3" {
+				t.Errorf("expected gap-3, got %s", evt.Object.GetName())
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timeout waiting for gap-3")
+		}
+	})
+
+	t.Run("resourceversion_is_numeric", func(t *testing.T) {
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		w := newTestWidget("rv-numeric", "blue", 1)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+
+		if _, err := strconv.ParseInt(w.GetResourceVersion(), 10, 64); err != nil {
+			t.Errorf("ResourceVersion %q is not a numeric string: %v", w.GetResourceVersion(), err)
+		}
+
+		list := &testWidgetList{}
+		if err := store.List(ctx, list); err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		if _, err := strconv.ParseInt(list.GetResourceVersion(), 10, 64); err != nil {
+			t.Errorf("List ResourceVersion %q is not a numeric string: %v", list.GetResourceVersion(), err)
+		}
+	})
+
+	t.Run("concurrent_updates_preserve_monotonicity", func(t *testing.T) {
+		if cfg.SkipGlobalRevisionMonotonicity {
+			t.Skip("backend uses per-object versioning, not global revision monotonicity")
+		}
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		watcher, err := store.Watch(ctx, &testWidgetList{})
+		if err != nil {
+			t.Fatalf("watch: %v", err)
+		}
+		defer watcher.Stop()
+
+		const writers = 5
+		var wg sync.WaitGroup
+		wg.Add(writers)
+		for i := 0; i < writers; i++ {
+			go func(id int) {
+				defer wg.Done()
+				w := newTestWidget(fmt.Sprintf("cmon-%d", id), "blue", id)
+				if err := store.Create(ctx, w); err != nil {
+					t.Errorf("create %d: %v", id, err)
+					return
+				}
+				w.Spec.Color = "red"
+				if err := store.Update(ctx, w); err != nil {
+					t.Errorf("update %d: %v", id, err)
+				}
+			}(i)
+		}
+		wg.Wait()
+
+		// Drain events and verify monotonicity
+		deadline := time.Now().Add(2 * time.Second)
+		var prevRV int64
+		violations := 0
+		for time.Now().Before(deadline) {
+			select {
+			case evt, ok := <-watcher.ResultChan():
+				if !ok {
+					goto done
+				}
+				rv, _ := strconv.ParseInt(evt.Object.GetResourceVersion(), 10, 64)
+				if rv <= prevRV {
+					violations++
+				}
+				prevRV = rv
+			case <-time.After(200 * time.Millisecond):
+				goto done
+			}
+		}
+	done:
+		if violations > 0 {
+			t.Errorf("watch stream had %d monotonicity violations under concurrent writes", violations)
 		}
 	})
 }

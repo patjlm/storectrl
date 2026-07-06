@@ -28,6 +28,7 @@ Return these error types so `apierrors.IsNotFound()` etc. work transparently:
 | `*AlreadyExistsError` | Create with existing key | 409 |
 | `*ConflictError` | Update with stale ResourceVersion | 409 |
 | `*RevisionTooOldError` | Watch from compacted revision | 410 Gone |
+| `*FencedError` | Write when lease is lost (sharded backends) | 409 |
 
 All error types implement `APIStatus`. This is critical — controller code universally uses `apierrors.IsNotFound(err)` and similar checks.
 
@@ -55,13 +56,16 @@ Backend decides how to implement — channels, polling, pub/sub, etc.
 
 Store must be safe for concurrent use. Use `sync.RWMutex` (reads are frequent, writes are rare).
 
-### Global revision counter
+### ResourceVersion
 
-Every mutation gets a unique, monotonically increasing revision used as the object's `ResourceVersion`. Use a global counter, not per-object. This is used for:
+ResourceVersion must be a numeric string (parseable via `strconv.ParseInt`) that increases monotonically with each mutation. The simplest approach is a global counter (memory, filesystem backends). Sharded backends like postgres may use per-object version numbers — see the `SkipGlobalRevisionMonotonicity` flag in the conformance suite.
+
+Used for:
 
 - Optimistic concurrency on Update
 - Watch resumption from a known point
-- List's ResourceVersion (set to current global revision so callers can start a watch without a gap)
+- List's ResourceVersion (set to current revision so callers can start a watch without a gap)
+- Cache-level stale-event suppression (cache skips events with RV ≤ cached)
 
 ### Optimistic concurrency
 
@@ -88,6 +92,14 @@ Maintain a bounded event log for replay (configurable via `WithEventLogSize` or 
 
 When a watcher's channel buffer is full, **close the watch** (not silently drop events). This lets consumers reconnect and replay from the event log.
 
+### Snapshot-consistent List
+
+List must return a snapshot-consistent view — all returned objects reflect state at a single point in time. For database backends, use a repeatable-read transaction or equivalent isolation.
+
+### No-op suppression (recommended)
+
+When Update receives content identical to what's stored, skip the revision bump and event emission. This prevents unnecessary handler calls in scenarios where status appliers or reconcilers rewrite unchanged content. The memory and filesystem backends implement this via JSON marshal comparison.
+
 ### Revision persistence
 
 If the backend survives restarts, persist the revision counter. See `filesystem/store.go` (`.revision` file) for an example.
@@ -96,12 +108,29 @@ If the backend survives restarts, persist the revision counter. See `filesystem/
 
 Backends that support server-side-apply-style merges implement real logic. Others return a clear error.
 
+## Conformance test suite
+
+Use `storetest.TestStore` to verify your backend satisfies all requirements:
+
+```go
+func TestMyBackend(t *testing.T) {
+    storetest.TestStore(t, storetest.Config{
+        NewStore: func(scheme *runtime.Scheme) storectrl.Store {
+            return mybackend.New(scheme)
+        },
+        SkipApply: true, // if Apply is not supported
+    })
+}
+```
+
+The suite tests CRUD, watch, concurrency, and invariants (revision monotonicity, no-op suppression, snapshot consistency, watch resumption). See `storetest.Config` for skip flags when your backend has intentionally different semantics.
+
 ## Step-by-step guide
 
 1. Create a new package (e.g., `storectrl/sql`)
 2. Implement `storectrl.Store` — use `memory/store.go` as reference
-3. Verify all requirements above are met
-4. Add tests using the same patterns as `example_test.go`
+3. Run the conformance suite to verify all requirements
+4. Add backend-specific tests for features not covered by the suite
 
 ## BaseObject and BaseList
 

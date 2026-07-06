@@ -12,20 +12,27 @@ Must scale from small development setups to production workloads with large obje
 
 ```
 storectrl/                 # Main package — all public API
-├── store.go              # Store interface, WatchFromRevision option
+├── store.go              # Store interface, WatchFromRevision option, backend invariants
 ├── watcher.go            # Watcher, Event, EventType (incl. EventBookmark)
-├── errors.go             # NotFoundError, AlreadyExistsError, ConflictError, RevisionTooOldError
+├── errors.go             # NotFoundError, AlreadyExistsError, ConflictError, RevisionTooOldError, FencedError
 ├── object.go             # BaseObject, BaseList (embed for client.Object compat)
 ├── client.go             # client.Client implementation wrapping Store
-├── cache.go              # cache.Cache implementation (watch-backed, async event queue, CacheOption config)
+├── cache.go              # cache.Cache implementation (watch-backed, async event queue, stale-event suppression)
 ├── listerwatcher.go      # StoreListerWatcher adapter (Store → client-go ListerWatcher)
 ├── example_test.go       # CRUD, concurrency, and reconciler tests
+├── storetest/            # Conformance test suite for Store backends
+│   └── storetest.go       # TestStore — CRUD, watch, concurrency, invariant tests
 ├── memory/               # In-memory Store backend
-│   ├── store.go           # MemoryStore — global revision, event log, watch resumption
+│   ├── store.go           # MemoryStore — global revision, event log, no-op suppression
 │   └── watcher.go         # memoryWatcher — overflow-closes-watch for safe reconnect
-└── filesystem/            # Filesystem Store backend
-    ├── store.go           # FileStore — JSON files, persisted revision counter
-    └── watcher.go         # fileWatcher — same overflow pattern as memory
+├── filesystem/            # Filesystem Store backend
+│   ├── store.go           # FileStore — JSON files, persisted revision, no-op suppression
+│   └── watcher.go         # fileWatcher — same overflow pattern as memory
+└── postgres/              # PostgreSQL Store backend (sharded, lease-fenced)
+    ├── store.go           # ShardedStore — wraps postgres-controller-backend
+    ├── store_test.go      # Integration tests (testcontainers)
+    ├── testdata/schema.sql # DB schema for tests
+    └── DESIGN.md          # Design reference from upstream module
 ```
 
 User-facing docs in `docs/`:
@@ -42,7 +49,8 @@ User-facing docs in `docs/`:
 
 3. **Errors implement `APIStatus`.** Critical for transparent swapping — `apierrors.IsNotFound(err)` must work without code changes.
 
-4. **Cache is watch-backed with async event processing.** List for initial sync, Watch for incremental updates. Reads go to in-memory cache, not store. Two scalability features:
+4. **Cache is watch-backed with async event processing.** List for initial sync, Watch for incremental updates. Reads go to in-memory cache, not store. Three defense layers:
+   - **Stale-event suppression** — `add()` and `update()` compare incoming ResourceVersion against cached; skip if not newer. Protects against backends that don't suppress no-ops.
    - **Async event queue** — per-key coalescing queue decouples handler calls from watch goroutine. Prevents slow handlers from blocking watch channel and triggering overflow→relist cascades. Coalescing rules: Add+Update→Add, Add+Delete→cancel, Update+Update→merge, Update+Delete→Delete, Delete+Add→preserve both. Initial snapshot delivered synchronously to new handlers.
    - **Smart relist diff** — On relist (`RevisionTooOldError`), diffs old vs new by ResourceVersion. Unchanged objects produce no handler call. Reduces relist cost from O(N) to O(changed).
 

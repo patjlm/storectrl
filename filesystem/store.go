@@ -1,6 +1,7 @@
 package filesystem
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -284,6 +285,10 @@ func (s *FileStore) Update(ctx context.Context, obj client.Object) error {
 
 	if objAccessor.GetResourceVersion() != storedAccessor.GetResourceVersion() {
 		return &storectrl.ConflictError{Key: key.String()}
+	}
+
+	if s.contentEqual(existing, obj, storedObj.(client.Object)) {
+		return json.Unmarshal(existing, obj)
 	}
 
 	rv := s.revision.Add(1)
@@ -589,6 +594,17 @@ func (s *FileStore) loadUIDCounter() {
 		return
 	}
 	s.uidCounter.Store(uid)
+}
+
+func (s *FileStore) contentEqual(existing []byte, obj client.Object, storedObj client.Object) bool {
+	inCopy := obj.DeepCopyObject().(client.Object)
+	inCopy.SetResourceVersion(storedObj.GetResourceVersion())
+	inCopy.SetUID(storedObj.GetUID())
+	b, err := json.MarshalIndent(inCopy, "", "  ")
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(existing, b)
 }
 
 func (s *FileStore) notifyWatchers(gvk schema.GroupVersionKind, event storectrl.Event) {
