@@ -87,3 +87,24 @@ func (e *RevisionTooOldError) Status() metav1.Status {
 		Code:    410,
 	}
 }
+
+// FencedError indicates that the lease for this bucket is no longer held or
+// has been fenced by another instance — equivalent to HTTP 409 Conflict.
+type FencedError struct {
+	Bucket int
+}
+
+func (e *FencedError) Error() string {
+	return fmt.Sprintf("bucket %d: lease not held or fenced", e.Bucket)
+}
+
+func (e *FencedError) Status() metav1.Status {
+	return metav1.Status{
+		Status:  metav1.StatusFailure,
+		Reason:  metav1.StatusReasonConflict,
+		Message: e.Error(),
+		Code:    409,
+	}
+}
+
+func (e *FencedError) APIStatus() metav1.Status { return e.Status() }

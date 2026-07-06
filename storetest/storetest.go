@@ -35,6 +35,23 @@ type Config struct {
 	// When true, Apply tests only verify the backend returns an error.
 	// When false (default), Apply conformance tests run.
 	SkipApply bool
+
+	// SkipWatchOverflow declares the backend watch channel does not close on
+	// buffer overflow. Poll-based backends (e.g. postgres) never overflow.
+	SkipWatchOverflow bool
+
+	// SkipWatchEventHistory declares the backend does not retain intermediate
+	// mutation history between polls — only the latest object state is visible.
+	// Poll-based backends replay current state, not individual Add/Modify/Delete
+	// transitions that happened between two polls.
+	SkipWatchEventHistory bool
+
+	// SkipConcurrencyWatchCount skips the exact event-count assertion in the
+	// concurrent CRUD+watch test. Poll-based backends that do not retain
+	// per-mutation history cannot guarantee one event per mutation — they deliver
+	// at most one event per object (current state) per poll cycle. Set this flag
+	// together with SkipWatchEventHistory when using a polling backend.
+	SkipConcurrencyWatchCount bool
 }
 
 // TestStore runs the full Store conformance suite against the given backend.
@@ -591,6 +608,9 @@ func testWatch(t *testing.T, cfg Config) {
 	})
 
 	t.Run("replay_mixed_event_types", func(t *testing.T) {
+		if cfg.SkipWatchEventHistory {
+			t.Skip("backend does not retain per-mutation history; only current state polled")
+		}
 		store := cfg.NewStore(testScheme())
 		ctx := context.Background()
 
@@ -785,6 +805,9 @@ func testWatch(t *testing.T, cfg Config) {
 	})
 
 	t.Run("overflow_closes_watch", func(t *testing.T) {
+		if cfg.SkipWatchOverflow {
+			t.Skip("backend watch does not close on buffer overflow")
+		}
 		store := cfg.NewStore(testScheme())
 		ctx := context.Background()
 
@@ -883,13 +906,27 @@ func testConcurrency(t *testing.T, cfg Config) {
 			}(i)
 		}
 		wg.Wait()
+		if cfg.SkipConcurrencyWatchCount {
+			// Polling backends have a debounce window before the first poll fires.
+			// Wait up to 3 seconds for at least one event instead of a fixed sleep.
+			deadline := time.Now().Add(3 * time.Second)
+			for time.Now().Before(deadline) && eventCount.Load() == 0 {
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
 		watcher.Stop()
 		<-done
 
 		count := eventCount.Load()
-		expected := int32(goroutines * 3)
-		if count != expected {
-			t.Errorf("expected %d events, got %d", expected, count)
+		if cfg.SkipConcurrencyWatchCount {
+			if count == 0 {
+				t.Errorf("expected at least 1 event from concurrent CRUD, got 0 (watcher appears dead)")
+			}
+		} else {
+			expected := int32(goroutines * 3)
+			if count != expected {
+				t.Errorf("expected %d events, got %d", expected, count)
+			}
 		}
 	})
 }
