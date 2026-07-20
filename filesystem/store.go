@@ -217,6 +217,7 @@ func (s *FileStore) Create(ctx context.Context, obj client.Object) error {
 
 	rv := s.revision.Add(1)
 	accessor.SetResourceVersion(strconv.FormatInt(rv, 10))
+	accessor.SetGeneration(1)
 
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
@@ -287,14 +288,68 @@ func (s *FileStore) Update(ctx context.Context, obj client.Object) error {
 		return &storectrl.ConflictError{Key: key.String()}
 	}
 
-	if s.contentEqual(existing, obj, storedObj.(client.Object)) {
+	// Split spec/status via JSON maps
+	var storedMap, inputMap map[string]json.RawMessage
+	if err := json.Unmarshal(existing, &storedMap); err != nil {
+		return err
+	}
+	inputJSON, err := json.Marshal(obj)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(inputJSON, &inputMap); err != nil {
+		return err
+	}
+
+	// Merge: input everything except status — keep stored status
+	mergedMap := make(map[string]json.RawMessage)
+	for k, v := range inputMap {
+		mergedMap[k] = v
+	}
+	if status, ok := storedMap["status"]; ok {
+		mergedMap["status"] = status
+	} else {
+		delete(mergedMap, "status")
+	}
+
+	specChanged := !bytes.Equal(storedMap["spec"], inputMap["spec"])
+
+	// Unmarshal merged back into an object
+	mergedJSON, err := json.Marshal(mergedMap)
+	if err != nil {
+		return err
+	}
+	merged := obj.DeepCopyObject().(client.Object)
+	if err := json.Unmarshal(mergedJSON, merged); err != nil {
+		return err
+	}
+
+	mergedAccessor, err := meta.Accessor(merged)
+	if err != nil {
+		return err
+	}
+	mergedAccessor.SetResourceVersion(storedAccessor.GetResourceVersion())
+	mergedAccessor.SetUID(storedAccessor.GetUID())
+	mergedAccessor.SetGeneration(storedAccessor.GetGeneration())
+
+	// No-op check: compare merged against stored
+	mergedBytes, err := json.MarshalIndent(merged, "", "  ")
+	if err != nil {
+		return err
+	}
+	if bytes.Equal(existing, mergedBytes) {
 		return json.Unmarshal(existing, obj)
 	}
 
-	rv := s.revision.Add(1)
-	objAccessor.SetResourceVersion(strconv.FormatInt(rv, 10))
+	// Generation tracking
+	if specChanged {
+		mergedAccessor.SetGeneration(storedAccessor.GetGeneration() + 1)
+	}
 
-	data, err := json.MarshalIndent(obj, "", "  ")
+	rv := s.revision.Add(1)
+	mergedAccessor.SetResourceVersion(strconv.FormatInt(rv, 10))
+
+	data, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -307,9 +362,138 @@ func (s *FileStore) Update(ctx context.Context, obj client.Object) error {
 		return err
 	}
 
+	// Copy merged result back to caller's object
+	if err := json.Unmarshal(data, obj); err != nil {
+		return err
+	}
+
 	event := storectrl.Event{
 		Type:   storectrl.EventModified,
-		Object: obj.DeepCopyObject().(client.Object),
+		Object: merged.DeepCopyObject().(client.Object),
+	}
+	s.logEvent(gvk, rv, event)
+	s.notifyWatchers(gvk, event)
+
+	return nil
+}
+
+func (s *FileStore) UpdateStatus(ctx context.Context, obj client.Object) error {
+	gvk, err := s.gvkForObject(obj)
+	if err != nil {
+		return err
+	}
+
+	key := client.ObjectKeyFromObject(obj)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	path := objectPath(s.root, gvk, key)
+
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &storectrl.NotFoundError{Key: key.String()}
+		}
+		return err
+	}
+
+	storedObj, err := s.scheme.New(gvk)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(existing, storedObj); err != nil {
+		return err
+	}
+
+	objAccessor, err := meta.Accessor(obj)
+	if err != nil {
+		return err
+	}
+	storedAccessor, err := meta.Accessor(storedObj)
+	if err != nil {
+		return err
+	}
+
+	if objAccessor.GetResourceVersion() != storedAccessor.GetResourceVersion() {
+		return &storectrl.ConflictError{Key: key.String()}
+	}
+
+	// Split spec/status via JSON maps
+	var storedMap, inputMap map[string]json.RawMessage
+	if err := json.Unmarshal(existing, &storedMap); err != nil {
+		return err
+	}
+	inputJSON, err := json.Marshal(obj)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(inputJSON, &inputMap); err != nil {
+		return err
+	}
+
+	// Merge: keep stored everything, only take input's status
+	mergedMap := make(map[string]json.RawMessage)
+	for k, v := range storedMap {
+		mergedMap[k] = v
+	}
+	if status, ok := inputMap["status"]; ok {
+		mergedMap["status"] = status
+	} else {
+		delete(mergedMap, "status")
+	}
+
+	// Unmarshal merged back into an object
+	mergedJSON, err := json.Marshal(mergedMap)
+	if err != nil {
+		return err
+	}
+	merged := obj.DeepCopyObject().(client.Object)
+	if err := json.Unmarshal(mergedJSON, merged); err != nil {
+		return err
+	}
+
+	mergedAccessor, err := meta.Accessor(merged)
+	if err != nil {
+		return err
+	}
+	mergedAccessor.SetResourceVersion(storedAccessor.GetResourceVersion())
+	mergedAccessor.SetUID(storedAccessor.GetUID())
+	mergedAccessor.SetGeneration(storedAccessor.GetGeneration())
+
+	// No-op check: compare merged against stored
+	mergedBytes, err := json.MarshalIndent(merged, "", "  ")
+	if err != nil {
+		return err
+	}
+	if bytes.Equal(existing, mergedBytes) {
+		return json.Unmarshal(existing, obj)
+	}
+
+	rv := s.revision.Add(1)
+	mergedAccessor.SetResourceVersion(strconv.FormatInt(rv, 10))
+
+	data, err := json.MarshalIndent(merged, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return err
+	}
+
+	if err := s.persistRevision(rv); err != nil {
+		return err
+	}
+
+	// Copy merged result back to caller's object
+	if err := json.Unmarshal(data, obj); err != nil {
+		return err
+	}
+
+	event := storectrl.Event{
+		Type:   storectrl.EventModified,
+		Object: merged.DeepCopyObject().(client.Object),
 	}
 	s.logEvent(gvk, rv, event)
 	s.notifyWatchers(gvk, event)
@@ -344,6 +528,19 @@ func (s *FileStore) Delete(ctx context.Context, obj client.Object) error {
 	}
 	if err := json.Unmarshal(data, storedObj); err != nil {
 		return err
+	}
+
+	// Conditional delete: if input has a ResourceVersion, check it matches
+	objAccessor, err := meta.Accessor(obj)
+	if err != nil {
+		return err
+	}
+	storedAccessor, err := meta.Accessor(storedObj)
+	if err != nil {
+		return err
+	}
+	if objAccessor.GetResourceVersion() != "" && objAccessor.GetResourceVersion() != storedAccessor.GetResourceVersion() {
+		return &storectrl.ConflictError{Key: key.String()}
 	}
 
 	if err := os.Remove(path); err != nil {
@@ -422,10 +619,6 @@ func (s *FileStore) Watch(ctx context.Context, list client.ObjectList, opts ...c
 
 	s.watchers[gvk] = append(s.watchers[gvk], w)
 	return w, nil
-}
-
-func (s *FileStore) Apply(_ context.Context, _ runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
-	return fmt.Errorf("apply not supported by the filesystem store backend")
 }
 
 func (s *FileStore) revisionPath() string {
@@ -594,17 +787,6 @@ func (s *FileStore) loadUIDCounter() {
 		return
 	}
 	s.uidCounter.Store(uid)
-}
-
-func (s *FileStore) contentEqual(existing []byte, obj client.Object, storedObj client.Object) bool {
-	inCopy := obj.DeepCopyObject().(client.Object)
-	inCopy.SetResourceVersion(storedObj.GetResourceVersion())
-	inCopy.SetUID(storedObj.GetUID())
-	b, err := json.MarshalIndent(inCopy, "", "  ")
-	if err != nil {
-		return false
-	}
-	return bytes.Equal(existing, b)
 }
 
 func (s *FileStore) notifyWatchers(gvk schema.GroupVersionKind, event storectrl.Event) {

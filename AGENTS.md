@@ -45,7 +45,7 @@ User-facing docs in `docs/`:
 
 1. **Reuse controller-runtime types, not reinvent them.** We import `client.Object`, `client.ObjectKey`, `cache.Cache`, etc. directly. Goal: minimal code change for controller authors.
 
-2. **Store is deliberately simple.** Mirrors `client.Reader` + `client.Writer` without Patch, DeleteAllOf, or SubResources. The `client.Client` wrapper composes those (Patch = Get + apply + Update, DeleteAllOf = List + Delete each, Status = just Update). Apply is on Store directly because support varies by backend.
+2. **Store enforces spec/status split.** `Update` writes spec + metadata only (preserves stored status). `UpdateStatus` writes status only (preserves stored spec). Generation tracking: `Create` sets generation=1, `Update` increments on spec change, `UpdateStatus` never increments. The `client.Client` wrapper composes Patch (Get + merge + Update), DeleteAllOf (List + Delete), and Status().Update() routes to `store.UpdateStatus()`.
 
 3. **Errors implement `APIStatus`.** Critical for transparent swapping — `apierrors.IsNotFound(err)` must work without code changes.
 

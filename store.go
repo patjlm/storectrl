@@ -3,7 +3,6 @@ package storectrl
 import (
 	"context"
 
-	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -67,12 +66,26 @@ type Store interface {
 	// May return FencedError for backends with lease-based fencing.
 	Create(ctx context.Context, obj client.Object) error
 
-	// Update replaces an existing object. Returns a ConflictError if the
-	// ResourceVersion does not match (optimistic concurrency).
+	// Update writes spec + metadata from the input object. Status fields in
+	// the input are silently ignored — the stored status is preserved.
+	// Increments metadata.generation when spec content changes; no-op
+	// updates (identical spec) must not increment generation or bump
+	// ResourceVersion.
+	// Returns a ConflictError if the ResourceVersion does not match.
 	// May return FencedError for backends with lease-based fencing.
 	Update(ctx context.Context, obj client.Object) error
 
-	// Delete removes an object. Returns a NotFoundError if not found.
+	// UpdateStatus writes status from the input object. Spec and metadata
+	// fields in the input are silently ignored — the stored spec is preserved.
+	// Does NOT increment metadata.generation.
+	// Returns a ConflictError if the ResourceVersion does not match.
+	// Returns a NotFoundError if the object does not exist.
+	// May return FencedError for backends with lease-based fencing.
+	UpdateStatus(ctx context.Context, obj client.Object) error
+
+	// Delete removes an object. Works with or without ResourceVersion
+	// (empty RV = unconditional delete).
+	// Returns a NotFoundError if not found.
 	// May return FencedError for backends with lease-based fencing.
 	Delete(ctx context.Context, obj client.Object) error
 
@@ -84,12 +97,4 @@ type Store interface {
 	// revision has been compacted, return RevisionTooOldError so callers
 	// can relist and restart.
 	Watch(ctx context.Context, list client.ObjectList, opts ...client.ListOption) (Watcher, error)
-
-	// Apply performs a server-side-apply-style patch. The apply configuration
-	// declares the desired field values; the store merges them using field
-	// ownership semantics appropriate for the backend.
-	//
-	// Backends that do not support apply should return a clear error
-	// (e.g. fmt.Errorf("apply not supported")).
-	Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.ApplyOption) error
 }

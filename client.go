@@ -178,7 +178,7 @@ func (c *storeClient) IsObjectNamespaced(obj runtime.Object) (bool, error) {
 }
 
 func (c *storeClient) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
-	return c.store.Apply(ctx, obj, opts...)
+	return fmt.Errorf("apply not supported")
 }
 
 type storeStatusWriter struct {
@@ -190,15 +190,53 @@ func (w *storeStatusWriter) Create(ctx context.Context, obj client.Object, subRe
 }
 
 func (w *storeStatusWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
-	return w.client.store.Update(ctx, obj)
+	return w.client.store.UpdateStatus(ctx, obj)
 }
 
 func (w *storeStatusWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
-	return w.client.Patch(ctx, obj, patch)
+	patchBytes, err := patch.Data(obj)
+	if err != nil {
+		return err
+	}
+	key := client.ObjectKeyFromObject(obj)
+	current, ok := obj.DeepCopyObject().(client.Object)
+	if !ok {
+		return fmt.Errorf("failed to deep copy object")
+	}
+	if err := w.client.store.Get(ctx, key, current); err != nil {
+		return err
+	}
+	currentBytes, err := json.Marshal(current)
+	if err != nil {
+		return err
+	}
+	var patchedBytes []byte
+	switch patch.Type() {
+	case types.JSONPatchType:
+		jp, err := jsonpatch.DecodePatch(patchBytes)
+		if err != nil {
+			return err
+		}
+		patchedBytes, err = jp.Apply(currentBytes)
+		if err != nil {
+			return err
+		}
+	case types.MergePatchType, types.StrategicMergePatchType:
+		patchedBytes, err = jsonpatch.MergePatch(currentBytes, patchBytes)
+		if err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unsupported patch type: %s", patch.Type())
+	}
+	if err := json.Unmarshal(patchedBytes, obj); err != nil {
+		return err
+	}
+	return w.client.store.UpdateStatus(ctx, obj)
 }
 
 func (w *storeStatusWriter) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
-	return w.client.store.Apply(ctx, obj)
+	return fmt.Errorf("apply not supported")
 }
 
 type storeSubResourceClient struct {
@@ -221,16 +259,54 @@ func (s *storeSubResourceClient) Update(ctx context.Context, obj client.Object, 
 	if s.unsupported {
 		return fmt.Errorf("subresource not supported")
 	}
-	return s.client.store.Update(ctx, obj)
+	return s.client.store.UpdateStatus(ctx, obj)
 }
 
 func (s *storeSubResourceClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
 	if s.unsupported {
 		return fmt.Errorf("subresource not supported")
 	}
-	return s.client.Patch(ctx, obj, patch)
+	patchBytes, err := patch.Data(obj)
+	if err != nil {
+		return err
+	}
+	key := client.ObjectKeyFromObject(obj)
+	current, ok := obj.DeepCopyObject().(client.Object)
+	if !ok {
+		return fmt.Errorf("failed to deep copy object")
+	}
+	if err := s.client.store.Get(ctx, key, current); err != nil {
+		return err
+	}
+	currentBytes, err := json.Marshal(current)
+	if err != nil {
+		return err
+	}
+	var patchedBytes []byte
+	switch patch.Type() {
+	case types.JSONPatchType:
+		jp, err := jsonpatch.DecodePatch(patchBytes)
+		if err != nil {
+			return err
+		}
+		patchedBytes, err = jp.Apply(currentBytes)
+		if err != nil {
+			return err
+		}
+	case types.MergePatchType, types.StrategicMergePatchType:
+		patchedBytes, err = jsonpatch.MergePatch(currentBytes, patchBytes)
+		if err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unsupported patch type: %s", patch.Type())
+	}
+	if err := json.Unmarshal(patchedBytes, obj); err != nil {
+		return err
+	}
+	return s.client.store.UpdateStatus(ctx, obj)
 }
 
 func (s *storeSubResourceClient) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
-	return s.client.store.Apply(ctx, obj)
+	return fmt.Errorf("apply not supported")
 }

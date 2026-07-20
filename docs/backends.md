@@ -10,9 +10,9 @@ type Store interface {
     List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error
     Create(ctx context.Context, obj client.Object) error
     Update(ctx context.Context, obj client.Object) error
+    UpdateStatus(ctx context.Context, obj client.Object) error
     Delete(ctx context.Context, obj client.Object) error
     Watch(ctx context.Context, list client.ObjectList, opts ...client.ListOption) (Watcher, error)
-    Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.ApplyOption) error
 }
 ```
 
@@ -26,7 +26,7 @@ Return these error types so `apierrors.IsNotFound()` etc. work transparently:
 |---|---|---|
 | `*NotFoundError` | Get/Update/Delete of nonexistent object | 404 |
 | `*AlreadyExistsError` | Create with existing key | 409 |
-| `*ConflictError` | Update with stale ResourceVersion | 409 |
+| `*ConflictError` | Update/UpdateStatus with stale ResourceVersion | 409 |
 | `*RevisionTooOldError` | Watch from compacted revision | 410 Gone |
 | `*FencedError` | Write when lease is lost (sharded backends) | 409 |
 
@@ -67,9 +67,22 @@ Used for:
 - List's ResourceVersion (set to current revision so callers can start a watch without a gap)
 - Cache-level stale-event suppression (cache skips events with RV ≤ cached)
 
+### Generation tracking
+
+- `Create` sets `metadata.generation = 1`.
+- `Update` increments `metadata.generation` when spec changes.
+- `UpdateStatus` does NOT increment generation.
+
+### Spec/status split
+
+- `Update` writes spec + metadata only. It silently preserves the stored status.
+- `UpdateStatus` writes status only. It silently preserves the stored spec.
+
+This mirrors the Kubernetes split-write model — spec and status have separate write paths so controllers and status reporters don't conflict.
+
 ### Optimistic concurrency
 
-Update must check `ResourceVersion` and return `*ConflictError` on mismatch. This enables standard controller retry patterns.
+Both `Update` and `UpdateStatus` must check `ResourceVersion` and return `*ConflictError` on mismatch. This enables standard controller retry patterns.
 
 ### Deep copying
 
@@ -96,17 +109,17 @@ When a watcher's channel buffer is full, **close the watch** (not silently drop 
 
 List must return a snapshot-consistent view — all returned objects reflect state at a single point in time. For database backends, use a repeatable-read transaction or equivalent isolation.
 
-### No-op suppression (recommended)
+### No-op suppression (mandatory)
 
-When Update receives content identical to what's stored, skip the revision bump and event emission. This prevents unnecessary handler calls in scenarios where status appliers or reconcilers rewrite unchanged content. The memory and filesystem backends implement this via JSON marshal comparison.
+When `Update` or `UpdateStatus` receives content identical to what's stored, skip the revision bump and event emission. This prevents unnecessary handler calls in scenarios where status appliers or reconcilers rewrite unchanged content. The memory and filesystem backends implement this via JSON marshal comparison. All Store backends must implement no-op suppression — it is enforced by the conformance test suite.
 
 ### Revision persistence
 
 If the backend survives restarts, persist the revision counter. See `filesystem/store.go` (`.revision` file) for an example.
 
-### Apply
+### Unconditional delete
 
-Backends that support server-side-apply-style merges implement real logic. Others return a clear error.
+`Delete` supports empty ResourceVersion for unconditional deletes. When ResourceVersion is empty, the object is deleted without checking for conflicts. When ResourceVersion is set, it must match the stored version.
 
 ## Conformance test suite
 
@@ -118,12 +131,11 @@ func TestMyBackend(t *testing.T) {
         NewStore: func(scheme *runtime.Scheme) storectrl.Store {
             return mybackend.New(scheme)
         },
-        SkipApply: true, // if Apply is not supported
     })
 }
 ```
 
-The suite tests CRUD, watch, concurrency, and invariants (revision monotonicity, no-op suppression, snapshot consistency, watch resumption). See `storetest.Config` for skip flags when your backend has intentionally different semantics.
+The suite tests CRUD (including UpdateStatus), watch, concurrency, and invariants (revision monotonicity, no-op suppression, generation tracking, spec/status split, snapshot consistency, watch resumption). See `storetest.Config` for skip flags when your backend has intentionally different semantics.
 
 ## Step-by-step guide
 

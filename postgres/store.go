@@ -288,13 +288,20 @@ func (s *ShardedStore) Update(ctx context.Context, obj client.Object) error {
 	return nil
 }
 
-// Delete removes an object. obj must carry the object_version annotation.
-func (s *ShardedStore) Delete(ctx context.Context, obj client.Object) error {
+func (s *ShardedStore) statusClientFor(ctx context.Context, gvk schema.GroupVersionKind) *crbridge.Client {
+	e := s.currentEpochs()
+	return crbridge.NewClient(makeConnFactory(ctx, s.connStr), gvkToString(gvk), s.assign, s.holderID, e.status)
+}
+
+// UpdateStatus writes only the status subresource. Spec and metadata in obj are
+// ignored — the stored spec is preserved. Uses the status-domain lease epoch
+// for fencing.
+func (s *ShardedStore) UpdateStatus(ctx context.Context, obj client.Object) error {
 	gvk, err := s.gvkForObject(obj)
 	if err != nil {
 		return err
 	}
-	spec, status, metadata, err := clientToColumns(obj)
+	_, status, _, err := clientToColumns(obj)
 	if err != nil {
 		return err
 	}
@@ -304,6 +311,52 @@ func (s *ShardedStore) Delete(ctx context.Context, obj client.Object) error {
 	}
 	if ov == "" {
 		return &storectrl.NotFoundError{Key: client.ObjectKeyFromObject(obj).String()}
+	}
+	crbObj := &crbridge.Object{
+		GVK:             gvkToString(gvk),
+		Namespace:       obj.GetNamespace(),
+		Name:            obj.GetName(),
+		ResourceVersion: ov,
+		BucketID:        s.bucketID,
+	}
+	result, err := s.statusClientFor(ctx, gvk).Status().Update(crbObj, status)
+	if err != nil {
+		return s.mapConflictToNotFound(ctx, gvk, mapCRBError(err, client.ObjectKeyFromObject(obj)), obj)
+	}
+	obj.SetResourceVersion(result.ResourceVersion)
+	setOVAnnotation(obj, result.ResourceVersion)
+	return nil
+}
+
+// Delete removes an object. Works with or without ResourceVersion — empty RV
+// triggers an unconditional delete (fetches current version first).
+func (s *ShardedStore) Delete(ctx context.Context, obj client.Object) error {
+	gvk, err := s.gvkForObject(obj)
+	if err != nil {
+		return err
+	}
+
+	ov := getOVAnnotation(obj)
+	if ov == "" {
+		ov = obj.GetResourceVersion()
+	}
+
+	// Unconditional delete: fetch current version first
+	if ov == "" {
+		key := client.ObjectKeyFromObject(obj)
+		crbObj, err := s.clientFor(ctx, gvk).Get(ctx, key.Namespace, key.Name)
+		if err != nil {
+			if errors.Is(err, crbridge.ErrNotFound) {
+				return &storectrl.NotFoundError{Key: key.String()}
+			}
+			return fmt.Errorf("get for unconditional delete %s: %w", key, err)
+		}
+		ov = crbObj.ResourceVersion
+	}
+
+	spec, status, metadata, err := clientToColumns(obj)
+	if err != nil {
+		return err
 	}
 	crbObj := &crbridge.Object{
 		GVK:             gvkToString(gvk),
@@ -362,11 +415,6 @@ func (s *ShardedStore) Watch(ctx context.Context, list client.ObjectList, opts .
 		return clientObj, crbToClient(crbObj, clientObj, gvk)
 	}
 	return newWatchBridge(wi, convertFn, listOpts.LabelSelector), nil
-}
-
-// Apply is not supported.
-func (s *ShardedStore) Apply(_ context.Context, _ runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
-	return fmt.Errorf("apply: not supported by postgres ShardedStore")
 }
 
 // --- GVK helpers ---

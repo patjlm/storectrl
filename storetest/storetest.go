@@ -31,11 +31,6 @@ type Config struct {
 	// so the suite can test RevisionTooOldError. If nil, those tests are skipped.
 	NewSmallEventLogStore func(*runtime.Scheme) storectrl.Store
 
-	// SkipApply declares that the backend does not implement Apply.
-	// When true, Apply tests only verify the backend returns an error.
-	// When false (default), Apply conformance tests run.
-	SkipApply bool
-
 	// SkipWatchOverflow declares the backend watch channel does not close on
 	// buffer overflow. Poll-based backends (e.g. postgres) never overflow.
 	SkipWatchOverflow bool
@@ -59,11 +54,6 @@ type Config struct {
 	// postgres use object_version for ResourceVersion, which is monotonic
 	// within a single object but not globally.
 	SkipGlobalRevisionMonotonicity bool
-
-	// SkipNoopSuppression declares the backend does not implement no-op
-	// suppression. The Store interface says no-op suppression is "recommended
-	// but not required" — backends without it should set this flag.
-	SkipNoopSuppression bool
 }
 
 // TestStore runs the full Store conformance suite against the given backend.
@@ -83,7 +73,9 @@ func TestStore(t *testing.T, cfg Config) {
 	t.Run("Delete", func(t *testing.T) { testDelete(t, cfg) })
 	t.Run("List", func(t *testing.T) { testList(t, cfg) })
 	t.Run("Watch", func(t *testing.T) { testWatch(t, cfg) })
-	t.Run("Apply", func(t *testing.T) { testApply(t, cfg) })
+	t.Run("UpdateStatus", func(t *testing.T) { testUpdateStatus(t, cfg) })
+	t.Run("Generation", func(t *testing.T) { testGeneration(t, cfg) })
+	t.Run("SpecStatusSplit", func(t *testing.T) { testSpecStatusSplit(t, cfg) })
 	t.Run("Concurrency", func(t *testing.T) { testConcurrency(t, cfg) })
 	t.Run("Invariants", func(t *testing.T) { testInvariants(t, cfg) })
 }
@@ -859,21 +851,473 @@ func testWatch(t *testing.T, cfg Config) {
 	})
 }
 
-// --- Apply ---
+// --- UpdateStatus ---
 
-func testApply(t *testing.T, cfg Config) {
-	if cfg.SkipApply {
-		t.Run("returns_error_when_unsupported", func(t *testing.T) {
-			store := cfg.NewStore(testScheme())
-			ctx := context.Background()
-			err := store.Apply(ctx, nil)
-			if err == nil {
-				t.Error("expected error from unsupported Apply")
-			}
-		})
-		return
-	}
-	t.Fatal("Apply conformance tests not yet implemented — set SkipApply: true if this backend does not support Apply")
+func testUpdateStatus(t *testing.T, cfg Config) {
+	t.Run("writes_status_only", func(t *testing.T) {
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		w := newTestWidget("w1", "blue", 42)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+
+		// Set status via UpdateStatus
+		w.Status.Ready = true
+		w.Status.Phase = "running"
+		if err := store.UpdateStatus(ctx, w); err != nil {
+			t.Fatalf("update status: %v", err)
+		}
+
+		got := &testWidget{}
+		if err := store.Get(ctx, client.ObjectKeyFromObject(w), got); err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if !got.Status.Ready || got.Status.Phase != "running" {
+			t.Errorf("status not updated: ready=%v phase=%s", got.Status.Ready, got.Status.Phase)
+		}
+		if got.Spec.Color != "blue" || got.Spec.Size != 42 {
+			t.Errorf("spec should be preserved: color=%s size=%d", got.Spec.Color, got.Spec.Size)
+		}
+	})
+
+	t.Run("preserves_spec", func(t *testing.T) {
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		w := newTestWidget("w1", "blue", 42)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+
+		// Modify both spec and status in the object, then UpdateStatus
+		w.Spec.Color = "red" // this should be IGNORED
+		w.Status.Ready = true
+		if err := store.UpdateStatus(ctx, w); err != nil {
+			t.Fatalf("update status: %v", err)
+		}
+
+		got := &testWidget{}
+		if err := store.Get(ctx, client.ObjectKeyFromObject(w), got); err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if got.Spec.Color != "blue" {
+			t.Errorf("UpdateStatus should preserve spec: got color=%s, want blue", got.Spec.Color)
+		}
+		if !got.Status.Ready {
+			t.Errorf("status should be updated: got ready=%v", got.Status.Ready)
+		}
+	})
+
+	t.Run("bumps_ResourceVersion", func(t *testing.T) {
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		w := newTestWidget("w1", "blue", 1)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		rvBefore := w.GetResourceVersion()
+
+		w.Status.Ready = true
+		if err := store.UpdateStatus(ctx, w); err != nil {
+			t.Fatalf("update status: %v", err)
+		}
+		if w.GetResourceVersion() == rvBefore {
+			t.Error("ResourceVersion should change after status update")
+		}
+	})
+
+	t.Run("stale_ResourceVersion_returns_ConflictError", func(t *testing.T) {
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		w := newTestWidget("w1", "blue", 1)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+
+		r1, r2 := &testWidget{}, &testWidget{}
+		key := client.ObjectKeyFromObject(w)
+		if err := store.Get(ctx, key, r1); err != nil {
+			t.Fatalf("get r1: %v", err)
+		}
+		if err := store.Get(ctx, key, r2); err != nil {
+			t.Fatalf("get r2: %v", err)
+		}
+
+		r1.Status.Ready = true
+		if err := store.UpdateStatus(ctx, r1); err != nil {
+			t.Fatalf("r1 update status: %v", err)
+		}
+
+		r2.Status.Phase = "failed"
+		err := store.UpdateStatus(ctx, r2)
+		var conflict *storectrl.ConflictError
+		if !stderrors.As(err, &conflict) {
+			t.Fatalf("expected ConflictError, got %v", err)
+		}
+	})
+
+	t.Run("missing_returns_NotFoundError", func(t *testing.T) {
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		w := newTestWidget("ghost", "blue", 1)
+		w.SetResourceVersion("1")
+		err := store.UpdateStatus(ctx, w)
+		if !errors.IsNotFound(err) {
+			t.Errorf("expected NotFound, got %v", err)
+		}
+	})
+
+	t.Run("noop_suppresses_event", func(t *testing.T) {
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		w := newTestWidget("noop-status", "blue", 42)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+
+		watcher, err := store.Watch(ctx, &testWidgetList{}, storectrl.WatchFromRevision(1))
+		if err != nil {
+			t.Fatalf("watch: %v", err)
+		}
+		defer watcher.Stop()
+
+		rvBefore := w.GetResourceVersion()
+		if err := store.UpdateStatus(ctx, w); err != nil {
+			t.Fatalf("noop update status: %v", err)
+		}
+		if w.GetResourceVersion() != rvBefore {
+			t.Errorf("no-op UpdateStatus should preserve RV: before=%s after=%s", rvBefore, w.GetResourceVersion())
+		}
+
+		select {
+		case evt := <-watcher.ResultChan():
+			t.Errorf("no-op UpdateStatus should not emit event, got %s", evt.Type)
+		case <-time.After(100 * time.Millisecond):
+		}
+	})
+}
+
+// --- Generation ---
+
+func testGeneration(t *testing.T, cfg Config) {
+	t.Run("create_sets_generation_1", func(t *testing.T) {
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		w := newTestWidget("w1", "blue", 1)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if w.GetGeneration() != 1 {
+			t.Errorf("expected generation=1 after create, got %d", w.GetGeneration())
+		}
+	})
+
+	t.Run("spec_change_increments", func(t *testing.T) {
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		w := newTestWidget("w1", "blue", 1)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+
+		w.Spec.Color = "red"
+		if err := store.Update(ctx, w); err != nil {
+			t.Fatalf("update: %v", err)
+		}
+		if w.GetGeneration() != 2 {
+			t.Errorf("expected generation=2 after spec change, got %d", w.GetGeneration())
+		}
+	})
+
+	t.Run("status_update_unchanged", func(t *testing.T) {
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		w := newTestWidget("w1", "blue", 1)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+
+		w.Status.Ready = true
+		if err := store.UpdateStatus(ctx, w); err != nil {
+			t.Fatalf("update status: %v", err)
+		}
+
+		got := &testWidget{}
+		if err := store.Get(ctx, client.ObjectKeyFromObject(w), got); err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if got.GetGeneration() != 1 {
+			t.Errorf("expected generation=1 after status update, got %d", got.GetGeneration())
+		}
+	})
+
+	t.Run("noop_update_unchanged", func(t *testing.T) {
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		w := newTestWidget("w1", "blue", 1)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+
+		if err := store.Update(ctx, w); err != nil {
+			t.Fatalf("noop update: %v", err)
+		}
+		if w.GetGeneration() != 1 {
+			t.Errorf("expected generation=1 after noop update, got %d", w.GetGeneration())
+		}
+	})
+}
+
+// --- SpecStatusSplit ---
+
+func testSpecStatusSplit(t *testing.T, cfg Config) {
+	t.Run("update_preserves_status", func(t *testing.T) {
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		w := newTestWidget("w1", "blue", 42)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+
+		// Set status first
+		w.Status.Ready = true
+		w.Status.Phase = "running"
+		if err := store.UpdateStatus(ctx, w); err != nil {
+			t.Fatalf("update status: %v", err)
+		}
+
+		// Now update spec — status should be preserved
+		got := &testWidget{}
+		if err := store.Get(ctx, client.ObjectKeyFromObject(w), got); err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		got.Spec.Color = "red"
+		if err := store.Update(ctx, got); err != nil {
+			t.Fatalf("update spec: %v", err)
+		}
+
+		final := &testWidget{}
+		if err := store.Get(ctx, client.ObjectKeyFromObject(w), final); err != nil {
+			t.Fatalf("get final: %v", err)
+		}
+		if final.Spec.Color != "red" {
+			t.Errorf("spec should be updated: got color=%s", final.Spec.Color)
+		}
+		if !final.Status.Ready || final.Status.Phase != "running" {
+			t.Errorf("status should be preserved: ready=%v phase=%s", final.Status.Ready, final.Status.Phase)
+		}
+	})
+
+	t.Run("update_ignores_input_status", func(t *testing.T) {
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		w := newTestWidget("w1", "blue", 42)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+
+		// Set status via UpdateStatus
+		w.Status.Ready = true
+		if err := store.UpdateStatus(ctx, w); err != nil {
+			t.Fatalf("update status: %v", err)
+		}
+
+		// Update with stale status but new spec
+		got := &testWidget{}
+		if err := store.Get(ctx, client.ObjectKeyFromObject(w), got); err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		got.Spec.Color = "red"
+		got.Status.Ready = false // this should be IGNORED by Update
+		if err := store.Update(ctx, got); err != nil {
+			t.Fatalf("update: %v", err)
+		}
+
+		final := &testWidget{}
+		if err := store.Get(ctx, client.ObjectKeyFromObject(w), final); err != nil {
+			t.Fatalf("get final: %v", err)
+		}
+		if !final.Status.Ready {
+			t.Errorf("Update should ignore input status: got ready=%v, want true", final.Status.Ready)
+		}
+	})
+
+	t.Run("update_status_preserves_spec", func(t *testing.T) {
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		w := newTestWidget("w1", "blue", 42)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+
+		// UpdateStatus with modified spec — spec should be ignored
+		w.Spec.Color = "red"
+		w.Status.Ready = true
+		if err := store.UpdateStatus(ctx, w); err != nil {
+			t.Fatalf("update status: %v", err)
+		}
+
+		got := &testWidget{}
+		if err := store.Get(ctx, client.ObjectKeyFromObject(w), got); err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if got.Spec.Color != "blue" {
+			t.Errorf("UpdateStatus should preserve spec: got color=%s, want blue", got.Spec.Color)
+		}
+	})
+
+	t.Run("deep_copy_isolation", func(t *testing.T) {
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		w := newTestWidget("w1", "blue", 42)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+
+		// Mutate caller's object after create
+		w.Spec.Color = "MUTATED"
+
+		got := &testWidget{}
+		if err := store.Get(ctx, client.ObjectKeyFromObject(w), got); err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if got.Spec.Color != "blue" {
+			t.Errorf("store should deep copy: got color=%s, want blue", got.Spec.Color)
+		}
+	})
+
+	t.Run("delete_without_resource_version", func(t *testing.T) {
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		w := newTestWidget("w1", "blue", 1)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+
+		// Clear RV and delete — should succeed (unconditional)
+		w.SetResourceVersion("")
+		if err := store.Delete(ctx, w); err != nil {
+			t.Fatalf("delete without RV should succeed: %v", err)
+		}
+
+		err := store.Get(ctx, client.ObjectKeyFromObject(w), &testWidget{})
+		if !errors.IsNotFound(err) {
+			t.Errorf("expected NotFound after delete, got %v", err)
+		}
+	})
+
+	t.Run("delete_with_resource_version", func(t *testing.T) {
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		w := newTestWidget("w1", "blue", 1)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+
+		// Delete with correct RV succeeds
+		if err := store.Delete(ctx, w); err != nil {
+			t.Fatalf("delete with correct RV: %v", err)
+		}
+	})
+
+	t.Run("concurrent_spec_and_status_writers", func(t *testing.T) {
+		store := cfg.NewStore(testScheme())
+		ctx := context.Background()
+
+		w := newTestWidget("w1", "blue", 1)
+		if err := store.Create(ctx, w); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+
+		const writers = 10
+		var wg sync.WaitGroup
+		var specErrors, statusErrors atomic.Int32
+
+		// Spec writers
+		wg.Add(writers)
+		for i := 0; i < writers; i++ {
+			go func(id int) {
+				defer wg.Done()
+				for retry := 0; retry < 10; retry++ {
+					got := &testWidget{}
+					if err := store.Get(ctx, client.ObjectKeyFromObject(w), got); err != nil {
+						continue
+					}
+					got.Spec.Color = fmt.Sprintf("color-%d", id)
+					err := store.Update(ctx, got)
+					if err == nil {
+						return
+					}
+					var conflict *storectrl.ConflictError
+					if !stderrors.As(err, &conflict) {
+						specErrors.Add(1)
+						return
+					}
+				}
+			}(i)
+		}
+
+		// Status writers
+		wg.Add(writers)
+		for i := 0; i < writers; i++ {
+			go func(id int) {
+				defer wg.Done()
+				for retry := 0; retry < 10; retry++ {
+					got := &testWidget{}
+					if err := store.Get(ctx, client.ObjectKeyFromObject(w), got); err != nil {
+						continue
+					}
+					got.Status.Phase = fmt.Sprintf("phase-%d", id)
+					err := store.UpdateStatus(ctx, got)
+					if err == nil {
+						return
+					}
+					var conflict *storectrl.ConflictError
+					if !stderrors.As(err, &conflict) {
+						statusErrors.Add(1)
+						return
+					}
+				}
+			}(i)
+		}
+
+		wg.Wait()
+
+		if specErrors.Load() > 0 {
+			t.Errorf("spec writers had %d non-conflict errors", specErrors.Load())
+		}
+		if statusErrors.Load() > 0 {
+			t.Errorf("status writers had %d non-conflict errors", statusErrors.Load())
+		}
+
+		// Final object should have some spec and some status set
+		final := &testWidget{}
+		if err := store.Get(ctx, client.ObjectKeyFromObject(w), final); err != nil {
+			t.Fatalf("get final: %v", err)
+		}
+		if final.Spec.Color == "blue" {
+			t.Error("expected spec to have been updated by at least one writer")
+		}
+		if final.Status.Phase == "" {
+			t.Error("expected status to have been updated by at least one writer")
+		}
+	})
 }
 
 // --- Concurrency ---
@@ -986,9 +1430,6 @@ func testInvariants(t *testing.T, cfg Config) {
 	})
 
 	t.Run("noop_update_suppresses_event", func(t *testing.T) {
-		if cfg.SkipNoopSuppression {
-			t.Skip("backend does not implement no-op suppression")
-		}
 		store := cfg.NewStore(testScheme())
 		ctx := context.Background()
 

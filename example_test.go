@@ -153,7 +153,8 @@ func TestWidgetCRUD(t *testing.T) {
 		t.Errorf("expected 2 widgets, got %d", len(list.Items))
 	}
 
-	// Delete
+	// Delete (unconditional — widget's RV is stale after retrieved was updated)
+	widget.SetResourceVersion("")
 	if err := c.Delete(ctx, widget); err != nil {
 		t.Fatalf("delete failed: %v", err)
 	}
@@ -236,7 +237,7 @@ func (r *WidgetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		widget.Status.Phase = "Pending"
 	}
 
-	if err := r.Update(ctx, widget); err != nil {
+	if err := r.Status().Update(ctx, widget); err != nil {
 		if errors.IsConflict(err) {
 			return ctrl.Result{RequeueAfter: time.Second}, nil
 		}
@@ -1310,6 +1311,7 @@ func TestAsyncEventCoalescing(t *testing.T) {
 	var totalUpdates atomic.Int32
 	_, err = informer.AddEventHandler(toolscache.ResourceEventHandlerFuncs{
 		UpdateFunc: func(_, _ interface{}) {
+			time.Sleep(time.Millisecond)
 			totalUpdates.Add(1)
 		},
 	})
@@ -1334,8 +1336,10 @@ func TestAsyncEventCoalescing(t *testing.T) {
 
 	totalUpdates.Store(0)
 
-	// Rapid-fire 50 updates — coalescing should reduce handler calls
-	for i := 0; i < 50; i++ {
+	// Rapid-fire 50 updates with a handler that simulates real work (1ms).
+	// Coalescing should merge queued updates while the handler is busy.
+	const burstCount = 50
+	for i := 0; i < burstCount; i++ {
 		w.Spec.Size = i + 100
 		if err := store.Update(ctx, w); err != nil {
 			t.Fatalf("update %d: %v", i, err)
@@ -1346,10 +1350,8 @@ func TestAsyncEventCoalescing(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	updates := totalUpdates.Load()
-	// With coalescing, we should see fewer than 50 update handler calls.
-	// Without coalescing, each update triggers a handler call = 50.
-	if updates >= 50 {
-		t.Errorf("expected coalescing to reduce updates below 50, got %d", updates)
+	if updates >= burstCount {
+		t.Errorf("expected coalescing to reduce updates below %d, got %d", burstCount, updates)
 	}
 	if updates == 0 {
 		t.Error("expected at least some updates to be delivered")

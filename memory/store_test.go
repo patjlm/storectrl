@@ -18,6 +18,5 @@ func TestStore(t *testing.T) {
 		NewSmallEventLogStore: func(scheme *runtime.Scheme) storectrl.Store {
 			return memory.NewStore(scheme, memory.WithEventLogSize(5))
 		},
-		SkipApply: true,
 	})
 }

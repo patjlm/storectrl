@@ -185,6 +185,8 @@ func (s *MemoryStore) Create(ctx context.Context, obj client.Object) error {
 		accessor.SetUID(types.UID(uid))
 	}
 
+	accessor.SetGeneration(1)
+
 	rv := s.revision.Add(1)
 	accessor.SetResourceVersion(strconv.FormatInt(rv, 10))
 
@@ -203,7 +205,9 @@ func (s *MemoryStore) Create(ctx context.Context, obj client.Object) error {
 	return s.copyObject(stored, obj)
 }
 
-// Update modifies an existing object in the store.
+// Update writes spec + metadata from the input object. Status fields in
+// the input are silently ignored — the stored status is preserved.
+// Increments metadata.generation when spec content changes.
 func (s *MemoryStore) Update(ctx context.Context, obj client.Object) error {
 	gvk, err := s.gvkForObject(obj)
 	if err != nil {
@@ -225,7 +229,6 @@ func (s *MemoryStore) Update(ctx context.Context, obj client.Object) error {
 		return &storectrl.NotFoundError{Key: key.String()}
 	}
 
-	// Check resource version
 	objAccessor, err := meta.Accessor(obj)
 	if err != nil {
 		return err
@@ -240,26 +243,191 @@ func (s *MemoryStore) Update(ctx context.Context, obj client.Object) error {
 		return &storectrl.ConflictError{Key: key.String()}
 	}
 
-	if s.contentEqual(stored, obj) {
+	// Marshal stored and input to split spec/status
+	storedJSON, err := json.Marshal(stored)
+	if err != nil {
+		return fmt.Errorf("marshalling stored object: %w", err)
+	}
+	inputJSON, err := json.Marshal(obj)
+	if err != nil {
+		return fmt.Errorf("marshalling input object: %w", err)
+	}
+
+	var storedMap, inputMap map[string]json.RawMessage
+	if err := json.Unmarshal(storedJSON, &storedMap); err != nil {
+		return fmt.Errorf("unmarshalling stored object: %w", err)
+	}
+	if err := json.Unmarshal(inputJSON, &inputMap); err != nil {
+		return fmt.Errorf("unmarshalling input object: %w", err)
+	}
+
+	// Build merged: input spec+metadata, stored status
+	mergedMap := make(map[string]json.RawMessage, len(inputMap))
+	for k, v := range inputMap {
+		mergedMap[k] = v
+	}
+	if status, ok := storedMap["status"]; ok {
+		mergedMap["status"] = status
+	} else {
+		delete(mergedMap, "status")
+	}
+
+	// Check if spec actually changed for generation tracking
+	specChanged := !bytes.Equal(storedMap["spec"], inputMap["spec"])
+
+	// Unmarshal merged into a new object for storage
+	mergedJSON, err := json.Marshal(mergedMap)
+	if err != nil {
+		return fmt.Errorf("marshalling merged object: %w", err)
+	}
+	merged := obj.DeepCopyObject().(client.Object)
+	if err := json.Unmarshal(mergedJSON, merged); err != nil {
+		return fmt.Errorf("unmarshalling merged object: %w", err)
+	}
+
+	// Restore server-managed metadata
+	mergedAccessor, err := meta.Accessor(merged)
+	if err != nil {
+		return err
+	}
+	mergedAccessor.SetResourceVersion(storedAccessor.GetResourceVersion())
+	mergedAccessor.SetUID(storedAccessor.GetUID())
+
+	// No-op check: compare merged against stored
+	if s.contentEqual(stored, merged) {
 		return s.copyObject(stored, obj)
 	}
 
-	rv := s.revision.Add(1)
-	objAccessor.SetResourceVersion(strconv.FormatInt(rv, 10))
+	// Generation tracking
+	if specChanged {
+		mergedAccessor.SetGeneration(storedAccessor.GetGeneration() + 1)
+	} else {
+		mergedAccessor.SetGeneration(storedAccessor.GetGeneration())
+	}
 
-	// Deep copy and store
-	updated := obj.DeepCopyObject().(client.Object)
-	gvkMap[key] = updated
+	rv := s.revision.Add(1)
+	mergedAccessor.SetResourceVersion(strconv.FormatInt(rv, 10))
+
+	// Store the merged object
+	gvkMap[key] = merged.DeepCopyObject().(client.Object)
 
 	event := storectrl.Event{
 		Type:   storectrl.EventModified,
-		Object: updated.DeepCopyObject().(client.Object),
+		Object: merged.DeepCopyObject().(client.Object),
 	}
 	s.logEvent(gvk, rv, event)
 	s.notifyWatchers(gvk, event)
 
 	// Copy back to obj to include updated fields
-	return s.copyObject(updated, obj)
+	return s.copyObject(merged, obj)
+}
+
+// UpdateStatus writes status from the input object. Spec and metadata
+// fields in the input are silently ignored — the stored spec is preserved.
+// Does NOT increment metadata.generation.
+func (s *MemoryStore) UpdateStatus(ctx context.Context, obj client.Object) error {
+	gvk, err := s.gvkForObject(obj)
+	if err != nil {
+		return err
+	}
+
+	key := client.ObjectKeyFromObject(obj)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	gvkMap, exists := s.objects[gvk]
+	if !exists {
+		return &storectrl.NotFoundError{Key: key.String()}
+	}
+
+	stored, exists := gvkMap[key]
+	if !exists {
+		return &storectrl.NotFoundError{Key: key.String()}
+	}
+
+	objAccessor, err := meta.Accessor(obj)
+	if err != nil {
+		return err
+	}
+
+	storedAccessor, err := meta.Accessor(stored)
+	if err != nil {
+		return err
+	}
+
+	if objAccessor.GetResourceVersion() != storedAccessor.GetResourceVersion() {
+		return &storectrl.ConflictError{Key: key.String()}
+	}
+
+	// Marshal stored and input to split spec/status
+	storedJSON, err := json.Marshal(stored)
+	if err != nil {
+		return fmt.Errorf("marshalling stored object: %w", err)
+	}
+	inputJSON, err := json.Marshal(obj)
+	if err != nil {
+		return fmt.Errorf("marshalling input object: %w", err)
+	}
+
+	var storedMap, inputMap map[string]json.RawMessage
+	if err := json.Unmarshal(storedJSON, &storedMap); err != nil {
+		return fmt.Errorf("unmarshalling stored object: %w", err)
+	}
+	if err := json.Unmarshal(inputJSON, &inputMap); err != nil {
+		return fmt.Errorf("unmarshalling input object: %w", err)
+	}
+
+	// Build merged: stored spec+metadata, input status
+	mergedMap := make(map[string]json.RawMessage, len(storedMap))
+	for k, v := range storedMap {
+		mergedMap[k] = v
+	}
+	if status, ok := inputMap["status"]; ok {
+		mergedMap["status"] = status
+	} else {
+		delete(mergedMap, "status")
+	}
+
+	// Unmarshal merged into a new object for storage
+	mergedJSON, err := json.Marshal(mergedMap)
+	if err != nil {
+		return fmt.Errorf("marshalling merged object: %w", err)
+	}
+	merged := obj.DeepCopyObject().(client.Object)
+	if err := json.Unmarshal(mergedJSON, merged); err != nil {
+		return fmt.Errorf("unmarshalling merged object: %w", err)
+	}
+
+	// Restore server-managed metadata — generation is NOT incremented
+	mergedAccessor, err := meta.Accessor(merged)
+	if err != nil {
+		return err
+	}
+	mergedAccessor.SetResourceVersion(storedAccessor.GetResourceVersion())
+	mergedAccessor.SetUID(storedAccessor.GetUID())
+	mergedAccessor.SetGeneration(storedAccessor.GetGeneration())
+
+	// No-op check: compare merged against stored
+	if s.contentEqual(stored, merged) {
+		return s.copyObject(stored, obj)
+	}
+
+	rv := s.revision.Add(1)
+	mergedAccessor.SetResourceVersion(strconv.FormatInt(rv, 10))
+
+	// Store the merged object
+	gvkMap[key] = merged.DeepCopyObject().(client.Object)
+
+	event := storectrl.Event{
+		Type:   storectrl.EventModified,
+		Object: merged.DeepCopyObject().(client.Object),
+	}
+	s.logEvent(gvk, rv, event)
+	s.notifyWatchers(gvk, event)
+
+	// Copy back to obj to include updated fields
+	return s.copyObject(merged, obj)
 }
 
 // Delete removes an object from the store.
@@ -282,6 +450,18 @@ func (s *MemoryStore) Delete(ctx context.Context, obj client.Object) error {
 	stored, exists := gvkMap[key]
 	if !exists {
 		return &storectrl.NotFoundError{Key: key.String()}
+	}
+
+	// Conditional delete: if caller provides a ResourceVersion, it must match
+	objRV := obj.GetResourceVersion()
+	if objRV != "" {
+		storedAccessor, err := meta.Accessor(stored)
+		if err != nil {
+			return err
+		}
+		if objRV != storedAccessor.GetResourceVersion() {
+			return &storectrl.ConflictError{Key: key.String()}
+		}
 	}
 
 	delete(gvkMap, key)
@@ -542,8 +722,4 @@ func (s *MemoryStore) eventsSince(fromRevision int64, gvk schema.GroupVersionKin
 		}
 	}
 	return events, nil
-}
-
-func (s *MemoryStore) Apply(_ context.Context, _ runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
-	return fmt.Errorf("apply not supported by the in-memory store backend")
 }

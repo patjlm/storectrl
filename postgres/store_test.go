@@ -246,7 +246,6 @@ func TestShardedStore_Conformance(t *testing.T) {
 				DELETE FROM bucket_leases WHERE bucket_id = 0 AND holder = $1`, holderID)
 			return newStore(t, dsn, scheme, 0, holderID)
 		},
-		SkipApply:                      true,
 		SkipWatchOverflow:              true,
 		SkipWatchEventHistory:          true,
 		SkipConcurrencyWatchCount:      true,

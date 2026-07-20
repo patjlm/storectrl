@@ -6,18 +6,21 @@ storectrl provides three pluggable components. Each wraps a `Store` backend into
 
 ### NewClient → `client.Client`
 
-Wraps a Store into controller-runtime's `client.Client` interface. Handles reads (Get, List) and writes (Create, Update, Delete, Patch, Status).
+Wraps a Store into controller-runtime's `client.Client` interface. Handles reads (Get, List) and writes (Create, Update, UpdateStatus, Delete, Patch).
 
 **Visibility:** Invisible after wiring. Controllers use the standard `client.Client` interface — they don't know the difference.
 
 **What it brings vs CR's default client:**
 - Works without an API server
 - Pluggable backend (SQL, GCP APIs, in-memory, filesystem, etc.)
+- **Spec/status split** — `Update` writes spec + metadata only, `UpdateStatus` writes status only. Mirrors the Kubernetes split-write model.
+- **Generation tracking** — `Create` sets `metadata.generation = 1`. `Update` increments generation when spec changes. `UpdateStatus` does not.
 
 **What it lacks:**
-- **Patch is simulated** — Get + apply diff + Update, not real server-side patch. Works for JSON Patch and Merge Patch. Strategic merge patch falls back to regular merge. Apply patch type is unsupported.
+- **Patch is simulated** — Get + apply diff + Update, not real server-side patch. Works for JSON Patch and Merge Patch. Strategic merge patch falls back to regular merge.
+- **No Apply** — server-side apply is not supported. Apply patch type returns an error.
 - **DeleteAllOf is simulated** — List + Delete each, not atomic.
-- **SubResources** — only `status` works (routes to Update). Custom subresources like `scale` return an error.
+- **SubResources** — only `status` works (routes to `UpdateStatus`). Custom subresources like `scale` return an error.
 - **No admission webhooks** — there's no API server to serve them.
 - **No API discovery** — RESTMapper is a stub.
 
